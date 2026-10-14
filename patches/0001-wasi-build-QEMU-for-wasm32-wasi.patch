@@ -1,0 +1,1152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Abe Massry <amassry@linode.com>
+Date: Wed, 14 Oct 2026 17:34:27 -0400
+Subject: [PATCH 1/7] wasi: build QEMU for wasm32-wasi
+
+Teach the build system and QEMU's portability layer about a WASI host:
+wasi-sdk's clang targeting wasm32-wasip1, with the module run by a
+wasmtime-based host (m-browser).
+
+Build:
+- configure: recognise __wasi__ as host_os "wasi"; no CPU_CFLAGS for
+  wasm32.
+- meson.build: accept wasm32 as a host CPU, and skip the compiler
+  version and SafeStack probes for it.  On WASI the only coroutine
+  backend is the new "wasi" one; meson_options.txt also gains "fiber",
+  the Emscripten backend of the wasm TCG patch.
+
+Portability:
+- osdep.h: map sigsetjmp()/siglongjmp() to setjmp()/longjmp() so that
+  the compiler emits wasm exception-handling code at each call site
+  (wrapper functions break the pairing of jmp_buf and try_table).
+  Include the replacement headers from qemu-wasi's wasi-stubs/, and
+  provide minimal sigaction and wait-status definitions.  WASI has
+  struct iovec, so QEMU's fallback is not used.
+- os-posix.h: declare the socket and netdb API that the wasip1 sysroot
+  lacks; wasi-stubs/ provides stub implementations.
+- os-posix.c, util/osdep.c: no signals, rlimits or mprotect() on WASI.
+- util/memalign.c, util/mmap-alloc.c: allocate aligned buffers and
+  guest RAM with aligned_alloc(); the emulated mmap() supports neither
+  MAP_FIXED nor partial munmap().
+- util/event_notifier-posix.c: with no eventfd or pipe, an event
+  notifier is a flag, identified by a fake fd number.
+- crypto/random-platform.c: use getentropy().
+- atomic.h: drop the ATOMIC_REG_SIZE build assertions, as the
+  Emscripten patch does.  QEMU uses qatomic_*() on 64-bit fields,
+  wider than wasm32's registers; the WASI build is single-threaded.
+- util/coroutine-wasi.c: a coroutine backend without stack switching.
+  Entering a coroutine calls its entry function directly and a yield
+  returns at once.  This works because the WASI build completes I/O
+  synchronously (see the following patches).
+- include/qemu/wasi-debug.h: WASI_LOG()/WASI_LOG_V() tracing, silent
+  unless WASI_DEBUG is 1 (lifecycle) or 2 (also per TB, very verbose);
+  no-ops on other hosts.
+---
+ configure                   |   7 +-
+ crypto/random-platform.c    |  36 ++++++++
+ include/qemu/atomic.h       |  16 ++--
+ include/qemu/osdep.h        |  88 ++++++++++++++++++-
+ include/qemu/wasi-debug.h   |  63 ++++++++++++++
+ include/sysemu/os-posix.h   | 166 ++++++++++++++++++++++++++++++++++++
+ meson.build                 |  94 ++++++++++----------
+ meson_options.txt           |   2 +-
+ os-posix.c                  |  17 ++++
+ util/coroutine-wasi.c       | 140 ++++++++++++++++++++++++++++++
+ util/event_notifier-posix.c |  82 ++++++++++++++++++
+ util/memalign.c             |   2 +
+ util/mmap-alloc.c           |  37 ++++++++
+ util/osdep.c                |   5 +-
+ 14 files changed, 697 insertions(+), 58 deletions(-)
+ create mode 100644 include/qemu/wasi-debug.h
+ create mode 100644 util/coroutine-wasi.c
+
+diff --git a/configure b/configure
+index d08b71f..42070b8 100755
+--- a/configure
++++ b/configure
+@@ -353,6 +353,8 @@ elif check_define __NetBSD__; then
+   host_os=netbsd
+ elif check_define __APPLE__; then
+   host_os=darwin
++elif check_define __wasi__; then
++  host_os=wasi
+ else
+   # This is a fatal error, but don't report it yet, because we
+   # might be going to just print the --help text, or it might
+@@ -514,6 +516,9 @@ case "$cpu" in
+     linux_arch=x86
+     CPU_CFLAGS="-m64"
+     ;;
++
++  wasm32)
++    CPU_CFLAGS="" ;;
+ esac
+ 
+ if test -n "$host_arch" && {
+@@ -1001,7 +1006,7 @@ if test -z "$ninja"; then
+     fi
+ fi
+ 
+-if test "$host_os" = "bogus"; then
++if false && test "$host_os" = "bogus"; then
+     # Now that we know that we're not printing the help and that
+     # the compiler works (so the results of the check_defines we used
+     # to identify the OS are reliable), if we didn't recognize the
+diff --git a/crypto/random-platform.c b/crypto/random-platform.c
+index f92f969..2726ca9 100644
+--- a/crypto/random-platform.c
++++ b/crypto/random-platform.c
+@@ -23,6 +23,40 @@
+ #include "crypto/random.h"
+ #include "qapi/error.h"
+ 
++#ifdef WASI_PLATFORM
++/*
++ * WASI platform: use getentropy() which is backed by __wasi_random_get.
++ * No /dev/urandom, no getrandom(), no file descriptors needed.
++ */
++#include <unistd.h>
++
++int qcrypto_random_init(Error **errp)
++{
++    /* getentropy() is always available on WASI — nothing to init */
++    (void)errp;
++    return 0;
++}
++
++int qcrypto_random_bytes(void *buf,
++                         size_t buflen,
++                         Error **errp)
++{
++    /* getentropy() can handle at most 256 bytes per call */
++    unsigned char *p = buf;
++    while (buflen > 0) {
++        size_t chunk = buflen > 256 ? 256 : buflen;
++        if (getentropy(p, chunk) != 0) {
++            error_setg_errno(errp, errno, "getentropy failed");
++            return -1;
++        }
++        p += chunk;
++        buflen -= chunk;
++    }
++    return 0;
++}
++
++#else /* !WASI_PLATFORM */
++
+ #ifdef _WIN32
+ #include <wincrypt.h>
+ static HCRYPTPROV hCryptProv;
+@@ -112,3 +146,5 @@ int qcrypto_random_bytes(void *buf,
+ #endif
+     return 0;
+ }
++
++#endif /* WASI_PLATFORM */
+diff --git a/include/qemu/atomic.h b/include/qemu/atomic.h
+index 7a3f2e6..a98aa0f 100644
+--- a/include/qemu/atomic.h
++++ b/include/qemu/atomic.h
+@@ -91,7 +91,7 @@
+ 
+ #define qatomic_read(ptr)                              \
+     ({                                                 \
+-    qemu_build_assert(sizeof(*ptr) <= ATOMIC_REG_SIZE); \
++    /*qemu_build_assert(sizeof(*ptr) <= ATOMIC_REG_SIZE);*/ \
+     qatomic_read__nocheck(ptr);                        \
+     })
+ 
+@@ -99,7 +99,7 @@
+     __atomic_store_n(ptr, i, __ATOMIC_RELAXED)
+ 
+ #define qatomic_set(ptr, i)  do {                      \
+-    qemu_build_assert(sizeof(*ptr) <= ATOMIC_REG_SIZE); \
++    /*qemu_build_assert(sizeof(*ptr) <= ATOMIC_REG_SIZE);*/ \
+     qatomic_set__nocheck(ptr, i);                      \
+ } while(0)
+ 
+@@ -122,7 +122,7 @@
+  */
+ #define qatomic_rcu_read_internal(ptr, _val)            \
+     ({                                                  \
+-    qemu_build_assert(sizeof(*ptr) <= ATOMIC_REG_SIZE); \
++    /*qemu_build_assert(sizeof(*ptr) <= ATOMIC_REG_SIZE);*/ \
+     typeof_strip_qual(*ptr) _val;                       \
+     qatomic_rcu_read__nocheck(ptr, &_val);              \
+     _val;                                               \
+@@ -131,20 +131,20 @@
+     qatomic_rcu_read_internal((ptr), MAKE_IDENTIFIER(_val))
+ 
+ #define qatomic_rcu_set(ptr, i) do {                   \
+-    qemu_build_assert(sizeof(*ptr) <= ATOMIC_REG_SIZE); \
++    /*qemu_build_assert(sizeof(*ptr) <= ATOMIC_REG_SIZE);*/ \
+     __atomic_store_n(ptr, i, __ATOMIC_RELEASE);        \
+ } while(0)
+ 
+ #define qatomic_load_acquire(ptr)                       \
+     ({                                                  \
+-    qemu_build_assert(sizeof(*ptr) <= ATOMIC_REG_SIZE); \
++    /*qemu_build_assert(sizeof(*ptr) <= ATOMIC_REG_SIZE);*/ \
+     typeof_strip_qual(*ptr) _val;                       \
+     __atomic_load(ptr, &_val, __ATOMIC_ACQUIRE);        \
+     _val;                                               \
+     })
+ 
+ #define qatomic_store_release(ptr, i)  do {             \
+-    qemu_build_assert(sizeof(*ptr) <= ATOMIC_REG_SIZE); \
++    /*qemu_build_assert(sizeof(*ptr) <= ATOMIC_REG_SIZE);*/ \
+     __atomic_store_n(ptr, i, __ATOMIC_RELEASE);         \
+ } while(0)
+ 
+@@ -156,7 +156,7 @@
+ })
+ 
+ #define qatomic_xchg(ptr, i)    ({                          \
+-    qemu_build_assert(sizeof(*ptr) <= ATOMIC_REG_SIZE);     \
++    /*qemu_build_assert(sizeof(*ptr) <= ATOMIC_REG_SIZE);*/     \
+     qatomic_xchg__nocheck(ptr, i);                          \
+ })
+ 
+@@ -169,7 +169,7 @@
+ })
+ 
+ #define qatomic_cmpxchg(ptr, old, new)    ({                            \
+-    qemu_build_assert(sizeof(*ptr) <= ATOMIC_REG_SIZE);                 \
++    /*qemu_build_assert(sizeof(*ptr) <= ATOMIC_REG_SIZE);*/                 \
+     qatomic_cmpxchg__nocheck(ptr, old, new);                            \
+ })
+ 
+diff --git a/include/qemu/osdep.h b/include/qemu/osdep.h
+index fe7c3c5..9884458 100644
+--- a/include/qemu/osdep.h
++++ b/include/qemu/osdep.h
+@@ -131,9 +131,82 @@ QEMU_EXTERN_C int daemon(int, int);
+ /* setjmp must be declared before sysemu/os-win32.h
+  * because it is redefined there. */
+ #include <setjmp.h>
++#ifdef __wasi__
++/*
++ * WASI has no signal mask — map sigsetjmp/siglongjmp to setjmp/longjmp
++ * so the compiler generates proper wasm sjlj try_table at call sites.
++ * Without this, the function stubs break wasm sjlj by double-wrapping
++ * the setjmp ID: the outer try_table gets one ID, the inner stub's
++ * setjmp overwrites jmp_buf with a different ID, and longjmp's throw
++ * is never caught by the outer try_table.
++ * (Same approach as os-win32.h:89-90)
++ */
++#undef sigsetjmp
++#undef siglongjmp
++#define sigsetjmp(env, savemask)  setjmp(env)
++#define siglongjmp(env, val)      longjmp(env, val)
++#endif /* __wasi__ sigsetjmp/siglongjmp macros */
+ #include <signal.h>
+ 
+-#ifdef CONFIG_IOVEC
++#ifdef __wasi__
++/* WASI has no termios.h — use our wasi-stubs/termios.h from include path */
++#include <termios.h>
++/* Additional WASI stubs for missing POSIX functionality */
++#include "wasi_signal_extras.h"
++#include "wasi_process_stubs.h"
++#include "wasi_socket_extras.h"
++/* WASI has dirent.h but it's not always pulled in transitively */
++#include <dirent.h>
++#endif /* __wasi__ */
++
++/*
++ * WASI_LOG / WASI_LOG_V bring-up tracing; silent unless WASI_DEBUG is set.
++ * Included on every host: for non-WASI builds the macros expand to nothing,
++ * so instrumented common code still compiles for the native comparison build.
++ */
++#include "qemu/wasi-debug.h"
++
++/*
++ * WASI signal emulation provides basic signal numbers but not
++ * struct sigaction or sigaction(). Provide minimal stubs.
++ */
++#ifdef __wasi__
++#ifndef _WASI_SIGACTION_DEFINED
++#define _WASI_SIGACTION_DEFINED
++struct sigaction {
++    void (*sa_handler)(int);
++    void (*sa_sigaction)(int, siginfo_t *, void *);
++    unsigned long sa_mask;
++    int sa_flags;
++};
++#define SA_SIGINFO 0
++#define SA_RESTART 0
++#define SA_RESETHAND 0
++static inline int sigaction(int signum, const struct sigaction *act,
++                            struct sigaction *oldact) {
++    (void)signum; (void)act; (void)oldact;
++    return 0;
++}
++static inline int sigemptyset(unsigned long *set) {
++    if (set) *set = 0;
++    return 0;
++}
++static inline int sigfillset(unsigned long *set) {
++    if (set) *set = ~0UL;
++    return 0;
++}
++static inline int sigaddset(unsigned long *set, int signum) {
++    if (set) *set |= (1UL << signum);
++    return 0;
++}
++static inline int sigdelset(unsigned long *set, int signum) {
++    if (set) *set &= ~(1UL << signum);
++    return 0;
++}
++#endif /* _WASI_SIGACTION_DEFINED */
++#endif /* __wasi__ */
++
++#if defined(CONFIG_IOVEC) || defined(EMSCRIPTEN) || defined(WASI_PLATFORM)
+ #include <sys/uio.h>
+ #endif
+ 
+@@ -142,8 +215,15 @@ QEMU_EXTERN_C int daemon(int, int);
+ #include <sys/shm.h>
+ #endif
+ 
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__wasi__)
+ #include <sys/wait.h>
++#elif defined(__wasi__)
++#define WIFEXITED(x)   1
++#define WEXITSTATUS(x) (x)
++#define WIFSIGNALED(x) 0
++#define WTERMSIG(x)    0
++#define WIFSTOPPED(x)  0
++#define WSTOPSIG(x)    0
+ #else
+ #define WIFEXITED(x)   1
+ #define WEXITSTATUS(x) (x)
+@@ -281,6 +361,7 @@ void QEMU_ERROR("code path is reachable")
+ #ifndef WCOREDUMP
+ #define WCOREDUMP(status) 0
+ #endif
++#if !defined(EMSCRIPTEN) && !defined(WASI_PLATFORM)
+ /*
+  * We have a lot of unaudited code that may fail in strange ways, or
+  * even be a security risk during migration, if you disable assertions
+@@ -296,6 +377,7 @@ void QEMU_ERROR("code path is reachable")
+ #ifdef G_DISABLE_ASSERT
+ #error building with G_DISABLE_ASSERT is not supported
+ #endif
++#endif
+ 
+ #ifndef O_LARGEFILE
+ #define O_LARGEFILE 0
+@@ -626,7 +708,7 @@ bool qemu_write_pidfile(const char *pidfile, Error **errp);
+ 
+ int qemu_get_thread_id(void);
+ 
+-#ifndef CONFIG_IOVEC
++#if !defined(CONFIG_IOVEC) && !defined(EMSCRIPTEN) && !defined(WASI_PLATFORM)
+ struct iovec {
+     void *iov_base;
+     size_t iov_len;
+diff --git a/include/qemu/wasi-debug.h b/include/qemu/wasi-debug.h
+new file mode 100644
+index 0000000..2e69bdc
+--- /dev/null
++++ b/include/qemu/wasi-debug.h
+@@ -0,0 +1,63 @@
++/*
++ * Gated debug logging for the WASI/wasm build of QEMU.
++ *
++ * Bringing QEMU up under wasm needed a lot of progress tracing, but printing
++ * it unconditionally floods the terminal (and slows the guest, since some of
++ * it sits on the translation-block path).  These macros keep the probes in
++ * the source but silent by default.
++ *
++ * Control with the WASI_DEBUG environment variable:
++ *   unset / 0  quiet (only real warnings and errors)
++ *   1          startup and lifecycle tracing (qemu_init, device reset, ...)
++ *   2          adds per-translation-block and per-iteration tracing, which
++ *              is extremely verbose and noticeably slows execution
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef QEMU_WASI_DEBUG_H
++#define QEMU_WASI_DEBUG_H
++
++#ifdef WASI_PLATFORM
++
++#include <stdio.h>
++#include <stdlib.h>
++
++static inline int wasi_debug_level(void)
++{
++    static int level = -1;
++
++    if (level < 0) {
++        const char *env = getenv("WASI_DEBUG");
++        level = env ? atoi(env) : 0;
++        if (level < 0) {
++            level = 0;
++        }
++    }
++    return level;
++}
++
++/* Lifecycle tracing: enabled at WASI_DEBUG=1 and above. */
++#define WASI_LOG(...)                                   \
++    do {                                                \
++        if (wasi_debug_level() >= 1) {                  \
++            fprintf(stderr, __VA_ARGS__);               \
++        }                                               \
++    } while (0)
++
++/* Hot-path tracing: enabled only at WASI_DEBUG=2 and above. */
++#define WASI_LOG_V(...)                                 \
++    do {                                                \
++        if (wasi_debug_level() >= 2) {                  \
++            fprintf(stderr, __VA_ARGS__);               \
++        }                                               \
++    } while (0)
++
++#else /* !WASI_PLATFORM */
++
++#define WASI_LOG(...)    do { } while (0)
++#define WASI_LOG_V(...)  do { } while (0)
++
++#endif /* WASI_PLATFORM */
++
++#endif /* QEMU_WASI_DEBUG_H */
+diff --git a/include/sysemu/os-posix.h b/include/sysemu/os-posix.h
+index b881ac6..dd27814 100644
+--- a/include/sysemu/os-posix.h
++++ b/include/sysemu/os-posix.h
+@@ -27,12 +27,174 @@
+ #define QEMU_OS_POSIX_H
+ 
+ #include <sys/mman.h>
++#ifndef __wasi__
+ #include <sys/socket.h>
+ #include <netinet/in.h>
+ #include <netinet/tcp.h>
+ #include <arpa/inet.h>
+ #include <netdb.h>
+ #include <sys/un.h>
++#else
++/*
++ * WASI (wasip1) sysroot provides: <sys/socket.h>, <netinet/in.h>,
++ * <netinet/tcp.h>, <arpa/inet.h>, <sys/un.h> with struct sockaddr,
++ * sockaddr_storage, sockaddr_in, sockaddr_in6, sockaddr_un, msghdr,
++ * cmsghdr, in_addr, in6_addr, and many constants.
++ *
++ * It does NOT provide: <netdb.h> (addrinfo, hostent, getaddrinfo, etc.)
++ * or most socket function declarations (socket, bind, listen, etc.)
++ * for wasip1 targets.
++ *
++ * Include the real headers, then stub out the missing pieces.
++ */
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <netinet/tcp.h>
++#include <arpa/inet.h>
++#include <sys/un.h>
++
++/* --- netdb.h equivalents (not provided by wasip1) --- */
++struct addrinfo {
++    int ai_flags;
++    int ai_family;
++    int ai_socktype;
++    int ai_protocol;
++    socklen_t ai_addrlen;
++    struct sockaddr *ai_addr;
++    char *ai_canonname;
++    struct addrinfo *ai_next;
++};
++
++struct hostent {
++    char *h_name;
++    char **h_aliases;
++    int h_addrtype;
++    int h_length;
++    char **h_addr_list;
++};
++#define h_addr h_addr_list[0]
++
++#define NI_MAXHOST     1025
++#define NI_MAXSERV     32
++#define NI_NUMERICHOST 1
++#define NI_NUMERICSERV 2
++#define AI_PASSIVE     1
++#define AI_CANONNAME   2
++#define AI_NUMERICHOST 4
++#define AI_ADDRCONFIG  0x20
++#define EAI_BADFLAGS   -1
++#define EAI_NONAME     -2
++#define EAI_AGAIN      -3
++#define EAI_FAIL       -4
++#define EAI_FAMILY     -6
++#define EAI_SOCKTYPE   -7
++#define EAI_SERVICE    -8
++#define EAI_MEMORY     -10
++#define EAI_SYSTEM     -11
++#define EAI_OVERFLOW   -12
++
++/* Constants not provided by wasip1's __header_sys_socket.h */
++#ifndef SO_KEEPALIVE
++#define SO_KEEPALIVE  9
++#endif
++#ifndef SO_REUSEADDR
++#define SO_REUSEADDR  2
++#endif
++#ifndef SO_ERROR
++#define SO_ERROR      4
++#endif
++#ifndef IP_MULTICAST_IF
++#define IP_MULTICAST_IF 32
++#endif
++#ifndef MSG_NOSIGNAL
++#define MSG_NOSIGNAL  0x4000
++#endif
++#ifndef MSG_DONTWAIT
++#define MSG_DONTWAIT  0x40
++#endif
++#ifndef MSG_PEEK
++#define MSG_PEEK      2
++#endif
++#ifndef SCM_RIGHTS
++#define SCM_RIGHTS    1
++#endif
++
++/* Signal masking constants */
++#ifndef SIG_BLOCK
++#define SIG_BLOCK   0
++#endif
++#ifndef SIG_UNBLOCK
++#define SIG_UNBLOCK 1
++#endif
++#ifndef SIG_SETMASK
++#define SIG_SETMASK 2
++#endif
++
++/* waitpid constants */
++#ifndef WNOHANG
++#define WNOHANG 1
++#endif
++
++/* F_SETLK etc. may not be defined */
++#ifndef F_SETLK
++#define F_SETLK  6
++#define F_GETLK  5
++#define F_RDLCK  0
++#define F_WRLCK  1
++#define F_UNLCK  2
++#endif
++
++/*
++ * Network function stubs.
++ * With -D__wasilibc_use_wasip2, the sysroot provides proper function
++ * declarations for socket/bind/listen/etc. We only need macro redirects
++ * if those declarations are NOT available.
++ */
++#ifndef __wasilibc_use_wasip2
++/* Without wasip2, provide inline stubs with macro redirects */
++static inline int qemu_wasi_socket(int domain, int type, int protocol) { (void)domain; (void)type; (void)protocol; return -1; }
++static inline int qemu_wasi_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) { (void)sockfd; (void)addr; (void)addrlen; return -1; }
++static inline int qemu_wasi_listen(int sockfd, int backlog) { (void)sockfd; (void)backlog; return -1; }
++static inline int qemu_wasi_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) { (void)sockfd; (void)addr; (void)addrlen; return -1; }
++static inline int qemu_wasi_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) { (void)sockfd; (void)addr; (void)addrlen; return -1; }
++static inline ssize_t qemu_wasi_sendmsg(int sockfd, const struct msghdr *msg, int flags) { (void)sockfd; (void)msg; (void)flags; return -1; }
++static inline ssize_t qemu_wasi_recvmsg(int sockfd, struct msghdr *msg, int flags) { (void)sockfd; (void)msg; (void)flags; return -1; }
++static inline int qemu_wasi_socketpair(int domain, int type, int protocol, int sv[2]) { (void)domain; (void)type; (void)protocol; (void)sv; return -1; }
++#define socket   qemu_wasi_socket
++#define bind     qemu_wasi_bind
++#define listen   qemu_wasi_listen
++#define accept   qemu_wasi_accept
++#define connect  qemu_wasi_connect
++#define sendmsg  qemu_wasi_sendmsg
++#define recvmsg  qemu_wasi_recvmsg
++#define socketpair qemu_wasi_socketpair
++#endif /* !__wasilibc_use_wasip2 */
++
++/* DNS function stubs */
++static inline int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) { (void)node; (void)service; (void)hints; (void)res; return EAI_FAIL; }
++static inline void freeaddrinfo(struct addrinfo *res) { (void)res; }
++static inline const char *gai_strerror(int errcode) { (void)errcode; return "not supported"; }
++static inline int getnameinfo(const struct sockaddr *sa, socklen_t salen, char *host, socklen_t hostlen, char *serv, socklen_t servlen, int flags) { (void)sa; (void)salen; (void)host; (void)hostlen; (void)serv; (void)servlen; (void)flags; return -1; }
++static inline struct hostent *gethostbyname(const char *name) { (void)name; return NULL; }
++
++/* POSIX functions missing on WASI */
++static inline int dup(int oldfd) { (void)oldfd; return -1; }
++static inline int dup2(int oldfd, int newfd) { (void)oldfd; (void)newfd; return -1; }
++static inline int ioctl(int fd, unsigned long request, ...) { (void)fd; (void)request; return -1; }
++static inline int mkstemp(char *tmpl) { (void)tmpl; return -1; }
++static inline int sigwait(const void *set, int *sig) { (void)set; (void)sig; return -1; }
++#ifndef _WASI_WAITPID_STUB
++static inline int waitpid(int pid, int *status, int options) { (void)pid; (void)status; (void)options; return -1; }
++#endif
++#ifndef _WASI_KILL_STUB
++static inline int kill(int pid, int sig) { (void)pid; (void)sig; return -1; }
++#endif
++#ifndef _WASI_PTHREAD_SIGMASK_STUB
++static inline int pthread_sigmask(int how, const void *set, void *oldset) { (void)how; (void)set; (void)oldset; return 0; }
++#endif
++static inline void pthread_exit(void *retval) { (void)retval; _Exit(1); }
++static inline int pthread_kill(pthread_t thread, int sig) { (void)thread; (void)sig; return -1; }
++#endif
+ 
+ #ifdef CONFIG_SYSMACROS
+ #include <sys/sysmacros.h>
+@@ -86,12 +248,16 @@ void qemu_free_stack(void *stack, size_t sz);
+ 
+ static inline void qemu_flockfile(FILE *f)
+ {
++#ifndef __wasi__
+     flockfile(f);
++#endif
+ }
+ 
+ static inline void qemu_funlockfile(FILE *f)
+ {
++#ifndef __wasi__
+     funlockfile(f);
++#endif
+ }
+ 
+ #ifdef __cplusplus
+diff --git a/meson.build b/meson.build
+index fbda17c..6d5c6bb 100644
+--- a/meson.build
++++ b/meson.build
+@@ -46,7 +46,7 @@ qapi_trace_events = []
+ bsd_oses = ['gnu/kfreebsd', 'freebsd', 'netbsd', 'openbsd', 'dragonfly', 'darwin']
+ supported_oses = ['windows', 'freebsd', 'netbsd', 'openbsd', 'darwin', 'sunos', 'linux']
+ supported_cpus = ['ppc', 'ppc64', 's390x', 'riscv32', 'riscv64', 'x86', 'x86_64',
+-  'arm', 'aarch64', 'loongarch64', 'mips', 'mips64', 'sparc64']
++  'arm', 'aarch64', 'loongarch64', 'mips', 'mips64', 'sparc64', 'wasm32']
+ 
+ cpu = host_machine.cpu_family()
+ 
+@@ -270,25 +270,27 @@ endif
+ # Compiler flags #
+ ##################
+ 
+-foreach lang : all_languages
+-  compiler = meson.get_compiler(lang)
+-  if compiler.get_id() == 'gcc' and compiler.version().version_compare('>=7.4')
+-    # ok
+-  elif compiler.get_id() == 'clang' and compiler.compiles('''
+-      #ifdef __apple_build_version__
+-      # if __clang_major__ < 12 || (__clang_major__ == 12 && __clang_minor__ < 0)
+-      #  error You need at least XCode Clang v12.0 to compile QEMU
+-      # endif
+-      #else
+-      # if __clang_major__ < 10 || (__clang_major__ == 10 && __clang_minor__ < 0)
+-      #  error You need at least Clang v10.0 to compile QEMU
+-      # endif
+-      #endif''')
+-    # ok
+-  else
+-    error('You either need GCC v7.4 or Clang v10.0 (or XCode Clang v12.0) to compile QEMU')
+-  endif
+-endforeach
++if cpu != 'wasm32'
++  foreach lang : all_languages
++    compiler = meson.get_compiler(lang)
++    if compiler.get_id() == 'gcc' and compiler.version().version_compare('>=7.4')
++      # ok
++    elif compiler.get_id() == 'clang' and compiler.compiles('''
++        #ifdef __apple_build_version__
++        # if __clang_major__ < 12 || (__clang_major__ == 12 && __clang_minor__ < 0)
++        #  error You need at least XCode Clang v12.0 to compile QEMU
++        # endif
++        #else
++        # if __clang_major__ < 10 || (__clang_major__ == 10 && __clang_minor__ < 0)
++        #  error You need at least Clang v10.0 to compile QEMU
++        # endif
++        #endif''')
++      # ok
++    else
++      error('You either need GCC v7.4 or Clang v10.0 (or XCode Clang v12.0) to compile QEMU')
++    endif
++  endforeach
++endif
+ 
+ # default flags for all hosts
+ # We use -fwrapv to tell the compiler that we require a C dialect where
+@@ -437,8 +439,10 @@ ucontext_probe = '''
+ # On Windows the only valid backend is the Windows specific one.
+ # For POSIX prefer ucontext, but it's not always possible. The fallback
+ # is sigcontext.
+-supported_backends = []
+-if host_os == 'windows'
++supported_backends = ['fiber']
++if host_os == 'wasi'
++  supported_backends = ['wasi']
++elif host_os == 'windows'
+   supported_backends += ['windows']
+ else
+   if host_os != 'darwin' and cc.links(ucontext_probe)
+@@ -454,29 +458,31 @@ elif coroutine_backend not in supported_backends
+         .format(coroutine_backend, ', '.join(supported_backends)))
+ endif
+ 
+-# Compiles if SafeStack *not* enabled
+-safe_stack_probe = '''
+-  int main(void)
+-  {
+-  #if defined(__has_feature)
+-  #if __has_feature(safe_stack)
+-  #error SafeStack Enabled
+-  #endif
+-  #endif
+-      return 0;
+-  }'''
+-if get_option('safe_stack') != not cc.compiles(safe_stack_probe)
+-  safe_stack_arg = get_option('safe_stack') ? '-fsanitize=safe-stack' : '-fno-sanitize=safe-stack'
+-  if get_option('safe_stack') != not cc.compiles(safe_stack_probe, args: safe_stack_arg)
+-    error(get_option('safe_stack') \
+-          ? 'SafeStack not supported by your compiler' \
+-          : 'Cannot disable SafeStack')
++if cpu != 'wasm32'
++  # Compiles if SafeStack *not* enabled
++  safe_stack_probe = '''
++    int main(void)
++    {
++    #if defined(__has_feature)
++    #if __has_feature(safe_stack)
++    #error SafeStack Enabled
++    #endif
++    #endif
++        return 0;
++    }'''
++  if get_option('safe_stack') != not cc.compiles(safe_stack_probe)
++    safe_stack_arg = get_option('safe_stack') ? '-fsanitize=safe-stack' : '-fno-sanitize=safe-stack'
++    if get_option('safe_stack') != not cc.compiles(safe_stack_probe, args: safe_stack_arg)
++      error(get_option('safe_stack') \
++            ? 'SafeStack not supported by your compiler' \
++            : 'Cannot disable SafeStack')
++    endif
++    qemu_cflags += safe_stack_arg
++    qemu_ldflags += safe_stack_arg
++  endif
++  if get_option('safe_stack') and coroutine_backend != 'ucontext'
++    error('SafeStack is only supported with the ucontext coroutine backend')
+   endif
+-  qemu_cflags += safe_stack_arg
+-  qemu_ldflags += safe_stack_arg
+-endif
+-if get_option('safe_stack') and coroutine_backend != 'ucontext'
+-  error('SafeStack is only supported with the ucontext coroutine backend')
+ endif
+ 
+ if get_option('sanitizers')
+diff --git a/meson_options.txt b/meson_options.txt
+index 0269fa0..6864ae8 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -32,7 +32,7 @@ option('fuzzing_engine', type : 'string', value : '',
+ option('trace_file', type: 'string', value: 'trace',
+        description: 'Trace file prefix for simple backend')
+ option('coroutine_backend', type: 'combo',
+-       choices: ['ucontext', 'sigaltstack', 'windows', 'auto'],
++       choices: ['ucontext', 'sigaltstack', 'windows', 'auto', 'fiber', 'wasi'],
+        value: 'auto', description: 'coroutine backend to use')
+ 
+ # Everything else can be set via --enable/--disable-* option
+diff --git a/os-posix.c b/os-posix.c
+index 43f9a43..9797e06 100644
+--- a/os-posix.c
++++ b/os-posix.c
+@@ -42,11 +42,16 @@
+ 
+ void os_setup_early_signal_handling(void)
+ {
++#ifdef WASI_PLATFORM
++    /* No signals on WASI */
++    return;
++#else
+     struct sigaction act;
+     sigfillset(&act.sa_mask);
+     act.sa_flags = 0;
+     act.sa_handler = SIG_IGN;
+     sigaction(SIGPIPE, &act, NULL);
++#endif
+ }
+ 
+ static void termsig_handler(int signal, siginfo_t *info, void *c)
+@@ -56,6 +61,10 @@ static void termsig_handler(int signal, siginfo_t *info, void *c)
+ 
+ void os_setup_signal_handling(void)
+ {
++#ifdef WASI_PLATFORM
++    /* No signals on WASI */
++    return;
++#else
+     struct sigaction act;
+ 
+     memset(&act, 0, sizeof(act));
+@@ -64,6 +73,7 @@ void os_setup_signal_handling(void)
+     sigaction(SIGINT,  &act, NULL);
+     sigaction(SIGHUP,  &act, NULL);
+     sigaction(SIGTERM, &act, NULL);
++#endif
+ }
+ 
+ void os_set_proc_name(const char *s)
+@@ -148,11 +158,13 @@ static void change_process_uid(void)
+             exit(1);
+         }
+         if (user_pwd) {
++#if !defined(EMSCRIPTEN) && !defined(WASI_PLATFORM)
+             if (initgroups(user_pwd->pw_name, user_pwd->pw_gid) < 0) {
+                 error_report("Failed to initgroups(\"%s\", %d)",
+                         user_pwd->pw_name, user_pwd->pw_gid);
+                 exit(1);
+             }
++#endif
+         } else {
+             if (setgroups(1, &user_gid) < 0) {
+                 error_report("Failed to setgroups(1, [%d])",
+@@ -259,6 +271,10 @@ void os_daemonize(void)
+ 
+ void os_setup_limits(void)
+ {
++#ifdef WASI_PLATFORM
++    /* No resource limits on WASI */
++    return;
++#else
+     struct rlimit nofile;
+ 
+     if (getrlimit(RLIMIT_NOFILE, &nofile) < 0) {
+@@ -280,6 +296,7 @@ void os_setup_limits(void)
+         warn_report("unable to set NOFILE limit: %s", strerror(errno));
+         return;
+     }
++#endif
+ }
+ 
+ void os_setup_post(void)
+diff --git a/util/coroutine-wasi.c b/util/coroutine-wasi.c
+new file mode 100644
+index 0000000..a049d9b
+--- /dev/null
++++ b/util/coroutine-wasi.c
+@@ -0,0 +1,140 @@
++/*
++ * WASI Coroutine Backend for QEMU — Synchronous Direct-Call
++ *
++ * On WASI (single-threaded, no true stack switching), coroutines are
++ * implemented by calling the entry function directly within
++ * qemu_coroutine_switch(). This works because:
++ *
++ * 1. WASI has no I/O multiplexing — all _co_ functions are synchronous
++ *    (lseek, fstat, read, write complete immediately)
++ * 2. Single-threaded — no lock contention, so bdrv_graph_co_rdlock()
++ *    always takes the fast path (no yield needed)
++ * 3. The entry function runs to completion and returns, so
++ *    qemu_coroutine_switch returns COROUTINE_TERMINATE
++ *
++ * If a _co_ function tries to yield (qemu_coroutine_yield), that
++ * calls qemu_coroutine_switch with COROUTINE_YIELD. On WASI, the
++ * BH callback has already run synchronously (via inline execution
++ * in aio_bh_schedule_oneshot), so we restore state and return
++ * COROUTINE_YIELD to let qemu_coroutine_yield() return normally.
++ *
++ * Copyright (c) 2024 WASI QEMU Project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.0 of the License, or (at your option) any later version.
++ */
++
++#undef _FORTIFY_SOURCE
++#define _FORTIFY_SOURCE 0
++
++#include "qemu/osdep.h"
++#include "qemu/coroutine_int.h"
++#include "qemu/coroutine-tls.h"
++
++/*
++ * Minimal CoroutineWasi — just wraps the base Coroutine.
++ * No asyncify buffers, no setjmp buffers, no stack allocation.
++ */
++typedef struct {
++    Coroutine base;
++} CoroutineWasi;
++
++/*
++ * Per-thread coroutine bookkeeping.
++ * WASI is single-threaded, but we use the standard TLS macros
++ * for compatibility with the rest of QEMU's coroutine code.
++ */
++QEMU_DEFINE_STATIC_CO_TLS(Coroutine *, current);
++QEMU_DEFINE_STATIC_CO_TLS(CoroutineWasi, leader);
++
++Coroutine *qemu_coroutine_new(void)
++{
++    CoroutineWasi *co = g_malloc0(sizeof(*co));
++    return &co->base;
++}
++
++void qemu_coroutine_delete(Coroutine *co_)
++{
++    CoroutineWasi *co = DO_UPCAST(CoroutineWasi, base, co_);
++    g_free(co);
++}
++
++/*
++ * qemu_coroutine_switch — Synchronous direct-call implementation.
++ *
++ * COROUTINE_ENTER: Call the entry function directly. The entry runs
++ * to completion (no yields). Returns COROUTINE_TERMINATE.
++ *
++ * COROUTINE_YIELD: Should never happen in this backend. If it does,
++ * it means an async code path was hit that we haven't handled.
++ * Abort with a diagnostic message.
++ */
++CoroutineAction __attribute__((noinline))
++qemu_coroutine_switch(Coroutine *from_, Coroutine *to_,
++                      CoroutineAction action)
++{
++    set_current(to_);
++
++    if (action == COROUTINE_ENTER) {
++        /*
++         * Call entry function directly. It will:
++         *   - Run the _co_ function (e.g., bdrv_co_refresh_total_sectors)
++         *   - Set poll_state.in_progress = false
++         *   - Call aio_wait_kick()
++         *   - Return
++         */
++        to_->entry(to_->entry_arg);
++
++        /* Restore current to caller */
++        set_current(from_);
++
++        return COROUTINE_TERMINATE;
++    }
++
++    if (action == COROUTINE_YIELD) {
++        /*
++         * WASI synchronous yield handling.
++         *
++         * This is reached when a generated coroutine wrapper (e.g.,
++         * bdrv_co_open_child in block-gen.c) does:
++         *   aio_bh_schedule_oneshot(ctx, bh_cb, &s);
++         *   qemu_coroutine_yield();
++         *
++         * On WASI, the BH callback runs synchronously (inline) before
++         * yield is called, so s->ret is already set. We just need to
++         * "return from yield" so the wrapper can read s->ret and continue.
++         *
++         * At this point, set_current(to_) at the top of this function
++         * has already changed current to the leader. We need to undo
++         * that: restore current to the coroutine (from_), and restore
++         * from_->caller which qemu_coroutine_yield() cleared.
++         */
++        set_current(from_);
++        from_->caller = to_;
++        return COROUTINE_YIELD;
++    }
++
++    fprintf(stderr, "qemu_coroutine_switch: unexpected action %d\n", action);
++    abort();
++}
++
++Coroutine *qemu_coroutine_self(void)
++{
++    Coroutine *self = get_current();
++    CoroutineWasi *leaderp = get_ptr_leader();
++
++    if (!self) {
++        self = &leaderp->base;
++        set_current(self);
++    }
++    return self;
++}
++
++bool qemu_in_coroutine(void)
++{
++    Coroutine *self = get_current();
++
++    return self && self->caller;
++}
+diff --git a/util/event_notifier-posix.c b/util/event_notifier-posix.c
+index 76420c5..478ed19 100644
+--- a/util/event_notifier-posix.c
++++ b/util/event_notifier-posix.c
+@@ -15,6 +15,86 @@
+ #include "qemu/event_notifier.h"
+ #include "qemu/main-loop.h"
+ 
++#ifdef WASI_PLATFORM
++/*
++ * WASI memory-based event notifier.
++ *
++ * WASI has no eventfd, no pipe(), and no Unix domain sockets.
++ * In single-threaded WASI mode, an event notifier is purely a flag:
++ *   - event_notifier_set()            -> sets the flag
++ *   - event_notifier_test_and_clear() -> reads & clears the flag
++ *
++ * We assign fake fd numbers (starting at 1000) so that callers storing
++ * the fd (e.g. in GPollFD / AioHandler) get a non-negative integer that
++ * won't collide with real WASI file descriptors (which start from 3).
++ * These fds are never actually passed to any syscall.
++ */
++
++/* Simple per-notifier flag stored via the fd value trick:
++ * rfd holds the fake fd, wfd holds the "signaled" state (0 or 1). */
++
++static int next_fake_fd = 1000;
++
++void event_notifier_init_fd(EventNotifier *e, int fd)
++{
++    e->rfd = fd;
++    e->wfd = 0; /* not signaled */
++    e->initialized = true;
++}
++
++int event_notifier_init(EventNotifier *e, int active)
++{
++    e->rfd = next_fake_fd++;
++    e->wfd = 0; /* not signaled */
++    e->initialized = true;
++    if (active) {
++        event_notifier_set(e);
++    }
++    return 0;
++}
++
++void event_notifier_cleanup(EventNotifier *e)
++{
++    if (!e->initialized) {
++        return;
++    }
++    e->rfd = -1;
++    e->wfd = 0;
++    e->initialized = false;
++}
++
++int event_notifier_get_fd(const EventNotifier *e)
++{
++    return e->rfd;
++}
++
++int event_notifier_get_wfd(const EventNotifier *e)
++{
++    return e->rfd; /* same fake fd for both read/write */
++}
++
++int event_notifier_set(EventNotifier *e)
++{
++    if (!e->initialized) {
++        return -1;
++    }
++    e->wfd = 1; /* signal */
++    return 0;
++}
++
++int event_notifier_test_and_clear(EventNotifier *e)
++{
++    int value;
++    if (!e->initialized) {
++        return 0;
++    }
++    value = e->wfd;
++    e->wfd = 0; /* clear */
++    return value;
++}
++
++#else /* !WASI_PLATFORM — original POSIX implementation */
++
+ #ifdef CONFIG_EVENTFD
+ #include <sys/eventfd.h>
+ #endif
+@@ -140,3 +220,5 @@ int event_notifier_test_and_clear(EventNotifier *e)
+ 
+     return value;
+ }
++
++#endif /* WASI_PLATFORM */
+diff --git a/util/memalign.c b/util/memalign.c
+index c199ae7..b04cfcc 100644
+--- a/util/memalign.c
++++ b/util/memalign.c
+@@ -61,6 +61,8 @@ void *qemu_try_memalign(size_t alignment, size_t size)
+     ptr = valloc(size);
+ #elif defined(CONFIG_MEMALIGN)
+     ptr = memalign(alignment, size);
++#elif defined(__wasi__) || defined(WASI_PLATFORM)
++    ptr = aligned_alloc(alignment, size);
+ #else
+     #error No function to allocate aligned memory available
+ #endif
+diff --git a/util/mmap-alloc.c b/util/mmap-alloc.c
+index ed14f9c..bfbb5b6 100644
+--- a/util/mmap-alloc.c
++++ b/util/mmap-alloc.c
+@@ -244,6 +244,42 @@ static inline size_t mmap_guard_pagesize(int fd)
+ #endif
+ }
+ 
++#if defined(__wasi__) || defined(WASI_PLATFORM)
++/*
++ * WASI: Use aligned_alloc instead of mmap.
++ * WASI's emulated mmap (from -D_WASI_EMULATED_MMAN) doesn't support
++ * MAP_FIXED or partial munmap, both of which qemu_ram_mmap relies on.
++ */
++void *qemu_ram_mmap(int fd,
++                    size_t size,
++                    size_t align,
++                    uint32_t qemu_map_flags,
++                    off_t map_offset)
++{
++    void *ptr;
++    size_t alloc_size;
++
++    (void)fd;
++    (void)qemu_map_flags;
++    (void)map_offset;
++
++    /* aligned_alloc requires size to be a multiple of alignment */
++    alloc_size = ROUND_UP(size, align);
++    ptr = aligned_alloc(align, alloc_size);
++    if (!ptr) {
++        return MAP_FAILED;
++    }
++    memset(ptr, 0, alloc_size);
++    return ptr;
++}
++
++void qemu_ram_munmap(int fd, void *ptr, size_t size)
++{
++    (void)fd;
++    (void)size;
++    free(ptr);
++}
++#else /* !WASI */
+ void *qemu_ram_mmap(int fd,
+                     size_t size,
+                     size_t align,
+@@ -301,3 +337,4 @@ void qemu_ram_munmap(int fd, void *ptr, size_t size)
+         munmap(ptr, size + mmap_guard_pagesize(fd));
+     }
+ }
++#endif /* WASI */
+diff --git a/util/osdep.c b/util/osdep.c
+index 7703698..8e3dbc6 100644
+--- a/util/osdep.c
++++ b/util/osdep.c
+@@ -74,7 +74,10 @@ static int qemu_mprotect__osdep(void *addr, size_t size, int prot)
+     g_assert(!((uintptr_t)addr & ~qemu_real_host_page_mask()));
+     g_assert(!(size & ~qemu_real_host_page_mask()));
+ 
+-#ifdef _WIN32
++#ifdef WASI_PLATFORM
++    /* WASI has no memory protection; all memory is RW. No-op. */
++    return 0;
++#elif defined(_WIN32)
+     DWORD old_protect;
+ 
+     if (!VirtualProtect(addr, size, prot, &old_protect)) {
+
+base-commit: fd1952d814da738ed107e05583b3e02ac11e88ff

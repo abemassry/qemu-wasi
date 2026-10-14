@@ -1,0 +1,30 @@
+# Build outputs (see Makefile)
+/qemu-src/
+/qemu-build/
+/qemu-native/
+/zlib-src/
+/zlib-wasi/
+/glib-wasi/build/
+/wasi-stubs/build/
+*.a
+*.o
+*.d
+*.wasm
+
+# Python
+__pycache__/
+*.pyc
+
+# Disk images and other large test files
+*.qcow2
+*.img
+*.raw
+*.iso
+
+# Editors and OS
+*.swp
+*~
+.DS_Store
+/.vscode/
+/.idea/
+/.cache/

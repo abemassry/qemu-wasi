@@ -1,0 +1,309 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Abe Massry <amassry@linode.com>
+Date: Wed, 14 Oct 2026 17:34:27 -0400
+Subject: [PATCH 5/7] ui: draw text consoles without pixman
+
+There is no pixman for WASI.  include/ui/pixman-minimal.h implements
+the part of its API that ui/console-vc.c and ui/qemu-pixman.c use:
+32 bpp images, solid fills, glyph blending through an a8 mask, and
+rectangle copies for scrolling.  With it the real text console
+(console-vc.c) is built instead of the stubs, so the monitor and the
+serial port can be shown as "vc" consoles.
+---
+ include/ui/pixman-minimal.h | 211 ++++++++++++++++++++++++++++++++++++
+ include/ui/qemu-pixman.h    |   2 +-
+ ui/meson.build              |   4 +-
+ ui/qemu-pixman.c            |   4 +-
+ 4 files changed, 217 insertions(+), 4 deletions(-)
+
+diff --git a/include/ui/pixman-minimal.h b/include/ui/pixman-minimal.h
+index 6dd7de1..06651e8 100644
+--- a/include/ui/pixman-minimal.h
++++ b/include/ui/pixman-minimal.h
+@@ -45,6 +45,7 @@
+ #define PIXMAN_MINIMAL_H
+ 
+ #define PIXMAN_TYPE_OTHER       0
++#define PIXMAN_TYPE_A           1
+ #define PIXMAN_TYPE_ARGB        2
+ #define PIXMAN_TYPE_ABGR        3
+ #define PIXMAN_TYPE_BGRA        8
+@@ -88,6 +89,8 @@ typedef enum {
+     PIXMAN_r5g6b5 =      PIXMAN_FORMAT(16, PIXMAN_TYPE_ARGB, 0, 5, 6, 5),
+     PIXMAN_a1r5g5b5 =    PIXMAN_FORMAT(16, PIXMAN_TYPE_ARGB, 1, 5, 5, 5),
+     PIXMAN_x1r5g5b5 =    PIXMAN_FORMAT(16, PIXMAN_TYPE_ARGB, 0, 5, 5, 5),
++    /* 8bpp alpha-only, used for font glyph masks */
++    PIXMAN_a8 =          PIXMAN_FORMAT(8, PIXMAN_TYPE_A, 8, 0, 0, 0),
+ } pixman_format_code_t;
+ 
+ typedef struct pixman_image pixman_image_t;
+@@ -104,6 +107,9 @@ struct pixman_image {
+     uint32_t *free_me;
+     pixman_image_destroy_func_t destroy_func;
+     void *destroy_data;
++    /* Solid-fill images carry a single colour instead of a pixel buffer. */
++    bool is_solid;
++    uint32_t solid_argb;
+ };
+ 
+ typedef struct pixman_color {
+@@ -236,4 +242,209 @@ static inline pixman_format_code_t pixman_image_get_format(pixman_image_t *i)
+     return i->format;
+ }
+ 
++/*
++ * ---- Minimal compositing subset ----
++ *
++ * Only what ui/console-vc.c and ui/qemu-pixman.c need to draw a text
++ * console: solid fills, glyph blending through an a8 mask, and a
++ * rectangle copy for scrolling.  Destination images are always 32bpp.
++ */
++
++typedef enum {
++    PIXMAN_OP_CLEAR = 0x00,
++    PIXMAN_OP_SRC   = 0x01,
++    PIXMAN_OP_OVER  = 0x03,
++} pixman_op_t;
++
++typedef struct pixman_rectangle16 {
++    int16_t  x, y;
++    uint16_t width, height;
++} pixman_rectangle16_t;
++
++static inline uint32_t pixman_color_to_argb32(const pixman_color_t *c)
++{
++    return ((uint32_t)(c->alpha >> 8) << 24) |
++           ((uint32_t)(c->red   >> 8) << 16) |
++           ((uint32_t)(c->green >> 8) <<  8) |
++           ((uint32_t)(c->blue  >> 8));
++}
++
++static inline pixman_image_t *pixman_image_create_solid_fill(const pixman_color_t *color)
++{
++    pixman_image_t *i = g_new0(pixman_image_t, 1);
++
++    i->ref_count = 1;
++    i->format = PIXMAN_a8r8g8b8;
++    i->is_solid = true;
++    i->solid_argb = pixman_color_to_argb32(color);
++    /* Conceptually infinite; large enough to cover any console. */
++    i->width = i->height = 1 << 15;
++
++    return i;
++}
++
++static inline uint32_t *pixman_row32(pixman_image_t *img, int y)
++{
++    return (uint32_t *)((uint8_t *)img->data + (size_t)y * img->stride);
++}
++
++/* Clip a w*h blit at (dx, dy) to the destination bounds. */
++static inline bool pixman_clip(pixman_image_t *dst, int *dx, int *dy,
++                               int *w, int *h)
++{
++    if (*dx < 0) {
++        *w += *dx;
++        *dx = 0;
++    }
++    if (*dy < 0) {
++        *h += *dy;
++        *dy = 0;
++    }
++    if (*dx + *w > dst->width) {
++        *w = dst->width - *dx;
++    }
++    if (*dy + *h > dst->height) {
++        *h = dst->height - *dy;
++    }
++    return *w > 0 && *h > 0;
++}
++
++static inline bool pixman_image_fill_rectangles(pixman_op_t op,
++                                                pixman_image_t *dst,
++                                                const pixman_color_t *color,
++                                                int n_rects,
++                                                const pixman_rectangle16_t *rects)
++{
++    uint32_t argb = pixman_color_to_argb32(color);
++    int n;
++
++    if (!dst || !dst->data) {
++        return false;
++    }
++
++    for (n = 0; n < n_rects; n++) {
++        int x = rects[n].x, y = rects[n].y;
++        int w = rects[n].width, h = rects[n].height;
++        int row, col;
++
++        if (!pixman_clip(dst, &x, &y, &w, &h)) {
++            continue;
++        }
++        for (row = 0; row < h; row++) {
++            uint32_t *p = pixman_row32(dst, y + row) + x;
++            for (col = 0; col < w; col++) {
++                p[col] = argb;
++            }
++        }
++    }
++    return true;
++}
++
++/* dst = src over dst, weighted by an 8-bit coverage value. */
++static inline uint32_t pixman_blend_over(uint32_t dst, uint32_t src, uint8_t a)
++{
++    uint32_t ia = 255u - a;
++    uint32_t r = ((((src >> 16) & 0xff) * a) + (((dst >> 16) & 0xff) * ia)) / 255;
++    uint32_t g = ((((src >>  8) & 0xff) * a) + (((dst >>  8) & 0xff) * ia)) / 255;
++    uint32_t b = ((((src      ) & 0xff) * a) + (((dst      ) & 0xff) * ia)) / 255;
++
++    return (dst & 0xff000000u) | (r << 16) | (g << 8) | b;
++}
++
++static inline void pixman_image_composite(pixman_op_t op,
++                                          pixman_image_t *src,
++                                          pixman_image_t *mask,
++                                          pixman_image_t *dst,
++                                          int src_x, int src_y,
++                                          int mask_x, int mask_y,
++                                          int dst_x, int dst_y,
++                                          int width, int height)
++{
++    int row, col;
++    int w = width, h = height, dx = dst_x, dy = dst_y;
++    int sx = src_x, sy = src_y;
++
++    if (!dst || !dst->data || !src) {
++        return;
++    }
++
++    /* Keep source offsets in step with any clipping of the destination. */
++    if (!pixman_clip(dst, &dx, &dy, &w, &h)) {
++        return;
++    }
++    sx += dx - dst_x;
++    sy += dy - dst_y;
++    mask_x += dx - dst_x;
++    mask_y += dy - dst_y;
++
++    if (src->is_solid) {
++        uint32_t argb = src->solid_argb;
++
++        if (!mask) {
++            pixman_color_t c = {
++                .red   = (uint16_t)(((argb >> 16) & 0xff) * 0x101),
++                .green = (uint16_t)(((argb >>  8) & 0xff) * 0x101),
++                .blue  = (uint16_t)(((argb      ) & 0xff) * 0x101),
++                .alpha = (uint16_t)(((argb >> 24) & 0xff) * 0x101),
++            };
++            pixman_rectangle16_t r = {
++                .x = (int16_t)dx, .y = (int16_t)dy,
++                .width = (uint16_t)w, .height = (uint16_t)h
++            };
++            pixman_image_fill_rectangles(PIXMAN_OP_SRC, dst, &c, 1, &r);
++            return;
++        }
++
++        /* Solid colour through an a8 coverage mask: the glyph case. */
++        for (row = 0; row < h; row++) {
++            int my = mask_y + row;
++            const uint8_t *m;
++            uint32_t *p;
++
++            if (my < 0 || my >= mask->height) {
++                continue;
++            }
++            m = (const uint8_t *)mask->data + (size_t)my * mask->stride;
++            p = pixman_row32(dst, dy + row) + dx;
++            for (col = 0; col < w; col++) {
++                int mx = mask_x + col;
++                uint8_t a = (mx >= 0 && mx < mask->width) ? m[mx] : 0;
++
++                if (a == 0xff || op == PIXMAN_OP_SRC) {
++                    p[col] = argb;
++                } else if (a) {
++                    p[col] = pixman_blend_over(p[col], argb, a);
++                }
++            }
++        }
++        return;
++    }
++
++    /* Plain 32bpp rectangle copy, used for console scrolling. */
++    if (!src->data) {
++        return;
++    }
++    if (sy < dy) {
++        /* Copy bottom-up so overlapping regions stay intact. */
++        for (row = h - 1; row >= 0; row--) {
++            if (sy + row < 0 || sy + row >= src->height) {
++                continue;
++            }
++            memmove(pixman_row32(dst, dy + row) + dx,
++                    pixman_row32(src, sy + row) + sx,
++                    (size_t)w * 4);
++        }
++    } else {
++        for (row = 0; row < h; row++) {
++            if (sy + row < 0 || sy + row >= src->height) {
++                continue;
++            }
++            memmove(pixman_row32(dst, dy + row) + dx,
++                    pixman_row32(src, sy + row) + sx,
++                    (size_t)w * 4);
++        }
++    }
++}
++
+ #endif /* PIXMAN_MINIMAL_H */
++
+diff --git a/include/ui/qemu-pixman.h b/include/ui/qemu-pixman.h
+index ef13a82..53063b3 100644
+--- a/include/ui/qemu-pixman.h
++++ b/include/ui/qemu-pixman.h
+@@ -77,7 +77,7 @@ int qemu_pixman_get_type(int rshift, int gshift, int bshift);
+ bool qemu_pixman_check_format(DisplayChangeListener *dcl,
+                               pixman_format_code_t format);
+ 
+-#ifdef CONFIG_PIXMAN
++#if defined(CONFIG_PIXMAN) || defined(WASI_PLATFORM)
+ pixman_format_code_t qemu_pixman_get_format(PixelFormat *pf);
+ pixman_image_t *qemu_pixman_linebuf_create(pixman_format_code_t format,
+                                            int width);
+diff --git a/ui/meson.build b/ui/meson.build
+index 28c7381..948f09a 100644
+--- a/ui/meson.build
++++ b/ui/meson.build
+@@ -19,7 +19,9 @@ system_ss.add(files(
+   'ui-qmp-cmds.c',
+   'util.c',
+ ))
+-system_ss.add(when: pixman, if_true: files('console-vc.c'), if_false: files('console-vc-stubs.c'))
++# WASI build: pixman-minimal implements enough compositing to draw the text
++# console, so always use the real console-vc.c rather than the stubs.
++system_ss.add(files('console-vc.c'))
+ if dbus_display
+   system_ss.add(files('dbus-module.c'))
+ endif
+diff --git a/ui/qemu-pixman.c b/ui/qemu-pixman.c
+index 5ca55dd..3672420 100644
+--- a/ui/qemu-pixman.c
++++ b/ui/qemu-pixman.c
+@@ -188,7 +188,7 @@ bool qemu_pixman_check_format(DisplayChangeListener *dcl,
+     }
+ }
+ 
+-#ifdef CONFIG_PIXMAN
++#if defined(CONFIG_PIXMAN) || defined(WASI_PLATFORM)
+ pixman_image_t *qemu_pixman_linebuf_create(pixman_format_code_t format,
+                                            int width)
+ {
+@@ -224,7 +224,7 @@ void qemu_pixman_image_unref(pixman_image_t *image)
+     pixman_image_unref(image);
+ }
+ 
+-#ifdef CONFIG_PIXMAN
++#if defined(CONFIG_PIXMAN) || defined(WASI_PLATFORM)
+ pixman_image_t *qemu_pixman_glyph_from_vgafont(int height, const uint8_t *font,
+                                                unsigned int ch)
+ {

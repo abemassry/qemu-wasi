@@ -1,0 +1,755 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Abe Massry <amassry@linode.com>
+Date: Wed, 14 Oct 2026 17:34:27 -0400
+Subject: [PATCH 3/7] accel/tcg: run the vCPU inline from the main loop on WASI
+
+WASI has no threads (pthread_create() is a stub that never runs the
+thread), so the round-robin vCPU cannot have a thread of its own.
+Instead the main loop runs it for a time slice on each iteration,
+through wasi_rr_cpu_step().
+
+- tcg-accel-ops-rr.c: do rr_cpu_thread_fn()'s setup inline, record the
+  one thread as the vCPU thread so that qemu_cpu_is_self() holds
+  (otherwise apic_update_irq() kicks the vCPU forever), and add
+  wasi_rr_cpu_step().  The thread is already an RCU reader.
+- tcg-all.c: no MTTCG; there is a single thread.
+- cpu-exec.c: as no timer thread kicks the vCPU, return to the main
+  loop periodically so that timers, and the IRQs they raise, are
+  serviced.
+- cputlb.c: let I/O accesses proceed instead of retranslating a
+  single-instruction TB (cpu_io_recompile()), which never converged
+  here; without icount the exact instruction boundary is not needed.
+- cpus.c, cpu-common.c: stop the vCPU, and run run_on_cpu() work,
+  directly; there is no other thread to wait for.
+- tcg-cpu-ops.h: no _Noreturn on the do_unaligned_access pointer, as
+  C11 does not allow it on function pointers.
+
+Debugging aids, off unless their environment variable is set:
+QEMU_DUMP_AT=<pc>,<n>,<addr>,<len>,<path> dumps guest memory and the
+CPU state on the n-th run of a TB; QEMU_LOOP_DIAG=1 turns on TCG
+logging when the same TB runs a million times in a row; the
+QEMU_STATUS_EVERY report includes the most recently executed TBs.
+---
+ accel/tcg/cpu-exec.c          | 251 +++++++++++++++++++++++++++++++++-
+ accel/tcg/cputlb.c            |  58 ++++++++
+ accel/tcg/tcg-accel-ops-rr.c  | 150 ++++++++++++++++++++
+ accel/tcg/tcg-all.c           |  13 ++
+ cpu-common.c                  |   6 +
+ include/hw/core/tcg-cpu-ops.h |   7 +
+ system/cpus.c                 |  27 +++-
+ 7 files changed, 510 insertions(+), 2 deletions(-)
+
+diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
+index 8163295..4f7fe5a 100644
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -286,6 +286,98 @@ hit:
+     return tb;
+ }
+ 
++/*
++ * Debugging aid: a ring of the most recently executed TBs (pc and cflags),
++ * recorded both when cpu_exec runs a TB and when a TB chains to another via
++ * lookup_and_goto_ptr.  Printed by the QEMU_STATUS_EVERY dump.
++ */
++#define TB_HISTORY_LEN 64
++static struct { vaddr pc; uint32_t cflags; } tb_history[TB_HISTORY_LEN];
++static unsigned tb_history_pos;
++uint64_t tb_exec_total;
++
++static inline void tb_history_push(vaddr pc, uint32_t cflags)
++{
++    tb_history[tb_history_pos % TB_HISTORY_LEN].pc = pc;
++    tb_history[tb_history_pos % TB_HISTORY_LEN].cflags = cflags;
++    tb_history_pos++;
++    tb_exec_total++;
++}
++
++/*
++ * Debugging aid: QEMU_LOOP_DIAG=1.  When the same TB has run a million times
++ * in a row (a guest that is not making progress), switch on in_asm, op_opt,
++ * exec and cpu logging for the next few dozen TBs and flush the TB cache so
++ * the looping block is retranslated with logging.  Useful when the looping
++ * address is not known in advance (e.g. under KASLR).
++ */
++/*
++ * The per-TB debugging hooks above cost time on every TB, so they only run
++ * when one of them was asked for.
++ */
++static int tb_debug_hooks = -1;
++
++static inline bool tb_debug_hooks_enabled(void)
++{
++    if (unlikely(tb_debug_hooks < 0)) {
++        tb_debug_hooks = getenv("QEMU_DUMP_AT") || getenv("QEMU_LOOP_DIAG") ||
++                         getenv("QEMU_STATUS_EVERY");
++    }
++    return tb_debug_hooks;
++}
++
++static void tb_loop_diag(CPUState *cpu, TranslationBlock *tb, vaddr pc)
++{
++    static int enabled = -1;
++    static vaddr last_pc;
++    static uint64_t same, logging_left;
++
++    if (enabled < 0) {
++        enabled = getenv("QEMU_LOOP_DIAG") != NULL;
++    }
++    if (!enabled) {
++        return;
++    }
++    if (logging_left) {
++        if (--logging_left == 0) {
++            qemu_set_log(0, NULL);
++            fprintf(stderr, "QEMU_LOOP_DIAG: logging off\n");
++        }
++        return;
++    }
++    if (pc != last_pc) {
++        last_pc = pc;
++        same = 0;
++        return;
++    }
++    if (++same == 20000000) {
++        fprintf(stderr, "QEMU_LOOP_DIAG: pc=0x%" VADDR_PRIx
++                " ran 20000000 times in a row; logging the next TBs\n", pc);
++        qemu_set_log(CPU_LOG_TB_IN_ASM | CPU_LOG_TB_OP_OPT | CPU_LOG_EXEC |
++                     CPU_LOG_TB_CPU | CPU_LOG_INT, NULL);
++        /*
++         * Retranslate just this TB so the logging covers its translation.
++         * Not tb_flush(): in serial TCG that runs immediately, even from
++         * helper_lookup_tb_ptr() inside a running TB chain.
++         */
++        tb_phys_invalidate(tb, -1);
++        logging_left = 40;
++    }
++}
++
++void tb_history_dump(FILE *f)
++{
++    unsigned n = MIN(tb_history_pos, TB_HISTORY_LEN);
++
++    fprintf(f, "TB history (%" PRIu64 " TBs total, oldest first):\n",
++            tb_exec_total);
++    for (unsigned i = tb_history_pos - n; i != tb_history_pos; i++) {
++        fprintf(f, "  %016" VADDR_PRIx " cf=%08x\n",
++                tb_history[i % TB_HISTORY_LEN].pc,
++                tb_history[i % TB_HISTORY_LEN].cflags);
++    }
++}
++
+ static void log_cpu_exec(vaddr pc, CPUState *cpu,
+                          const TranslationBlock *tb)
+ {
+@@ -429,6 +521,10 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
+     if (qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) {
+         log_cpu_exec(pc, cpu, tb);
+     }
++    if (unlikely(tb_debug_hooks_enabled())) {
++        tb_history_push(pc, tb->cflags);
++        tb_loop_diag(cpu, tb, pc);
++    }
+ 
+     return tb->tc.ptr;
+ }
+@@ -443,6 +539,70 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
+  * TCG is not considered a security-sensitive part of QEMU so this does not
+  * affect the impact of CFI in environment with high security requirements
+  */
++/*
++ * Debugging aid for comparing builds (e.g. native vs wasm32 TCG backends).
++ *
++ *   QEMU_DUMP_AT=<pc>,<n>,<addr>,<len>,<path>
++ *
++ * On the <n>-th execution (decimal, 1-based) of the TB that starts at guest
++ * pc <pc>, write <len> bytes of guest physical memory starting at <addr> to
++ * <path> and print the CPU state to stderr.  <pc>, <addr> and <len> are hex.
++ * One-shot.  Run with "-d nochain" so that every TB execution passes through
++ * cpu_tb_exec() and the count matches the -d exec trace.
++ */
++static void debug_dump_at(CPUState *cpu, vaddr pc)
++{
++    static int state = -1;          /* -1 unparsed, 0 off, 1 armed */
++    static vaddr want_pc;
++    static uint64_t want_n, seen, addr, len;
++    static char path[512];
++
++    if (likely(state == 0)) {
++        return;
++    }
++    if (state < 0) {
++        const char *spec = getenv("QEMU_DUMP_AT");
++        unsigned long long p, n, a, l;
++
++        state = 0;
++        if (!spec) {
++            return;
++        }
++        if (sscanf(spec, "%llx,%llu,%llx,%llx,%511s", &p, &n, &a, &l, path) != 5) {
++            fprintf(stderr, "QEMU_DUMP_AT: expected <pc>,<n>,<addr>,<len>,<path>\n");
++            return;
++        }
++        want_pc = p;
++        want_n = n;
++        addr = a;
++        len = l;
++        state = 1;
++        fprintf(stderr, "QEMU_DUMP_AT: armed pc=0x%llx n=%llu addr=0x%llx len=0x%llx -> %s\n",
++                p, n, a, l, path);
++    }
++    if (pc != want_pc || ++seen != want_n) {
++        return;
++    }
++
++    state = 0;
++    FILE *f = fopen(path, "wb");
++    if (!f) {
++        fprintf(stderr, "QEMU_DUMP_AT: cannot open %s\n", path);
++        return;
++    }
++    uint8_t buf[4096];
++    for (uint64_t off = 0; off < len; off += sizeof(buf)) {
++        size_t chunk = MIN(sizeof(buf), len - off);
++        cpu_physical_memory_read(addr + off, buf, chunk);
++        fwrite(buf, 1, chunk, f);
++    }
++    fclose(f);
++    fprintf(stderr, "QEMU_DUMP_AT: hit #%" PRIu64 " of pc=0x%" VADDR_PRIx
++            ", dumped 0x%" PRIx64 "+0x%" PRIx64 " to %s\n",
++            want_n, pc, addr, len, path);
++    cpu_dump_state(cpu, stderr, 0);
++}
++
+ static inline TranslationBlock * QEMU_DISABLE_CFI
+ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
+ {
+@@ -453,6 +613,11 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
+     if (qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) {
+         log_cpu_exec(log_pc(cpu, itb), cpu, itb);
+     }
++    if (unlikely(tb_debug_hooks_enabled())) {
++        debug_dump_at(cpu, log_pc(cpu, itb));
++        tb_history_push(log_pc(cpu, itb), itb->cflags);
++        tb_loop_diag(cpu, itb, log_pc(cpu, itb));
++    }
+ 
+     qemu_thread_jit_execute();
+     ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
+@@ -785,8 +950,21 @@ static inline bool icount_exit_request(CPUState *cpu)
+ }
+ 
+ static inline bool cpu_handle_interrupt(CPUState *cpu,
+-                                        TranslationBlock **last_tb)
++                                       TranslationBlock **last_tb)
+ {
++#ifdef WASI_PLATFORM
++    static int hi_diag = 0;
++    bool hi_trace = (hi_diag < 5 || (hi_diag % 10000000) == 0);
++
++    /*
++     * Number of TB executions between forced yields to the main loop.
++     * Smaller = more responsive timers (IRQ0 fires closer to real time),
++     * larger = less main-loop overhead. Tunable.
++     */
++#ifndef WASI_TB_YIELD_SLICE
++#define WASI_TB_YIELD_SLICE 4000    /* keep in step with tcg/wasm32/wasi_platform.h */
++#endif
++#endif
+     /*
+      * If we have requested custom cflags with CF_NOIRQ we should
+      * skip checking here. Any pending interrupts will get picked up
+@@ -807,6 +985,24 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
+         int interrupt_request;
+         bql_lock();
+         interrupt_request = cpu->interrupt_request;
++#ifdef WASI_PLATFORM
++        if (hi_trace) {
++#if defined(TARGET_I386)
++            X86CPU *hi_xc = X86_CPU(cpu);
++            CPUArchState *hi_env = &hi_xc->env;
++            WASI_LOG_V(
++                    "WASI_HI[%d]: irq=0x%x IF=%d inhibit=%d cpl=%d cs:eip=0x%04x:0x%08x\n",
++                    hi_diag, interrupt_request,
++                    !!(hi_env->eflags & IF_MASK),
++                    !!(hi_env->hflags & HF_INHIBIT_IRQ_MASK),
++                    (int)(hi_env->hflags & HF_CPL_MASK),
++                    (uint32_t)hi_env->segs[R_CS].selector,
++                    (uint32_t)hi_env->eip);
++#else
++            WASI_LOG_V("WASI_HI[%d]: interrupt_request=0x%x\n", hi_diag, interrupt_request);
++#endif
++        }
++#endif
+         if (unlikely(cpu->singlestep_enabled & SSTEP_NOIRQ)) {
+             /* Mask out external interrupts for this step. */
+             interrupt_request &= ~CPU_INTERRUPT_SSTEP_MASK;
+@@ -888,15 +1084,58 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
+         bql_unlock();
+     }
+ 
++    /*
++     * WASI note: an earlier port cleared exit_request here unconditionally
++     * to stop a livelock in which apic_update_irq() kept kicking the vCPU.
++     * That livelock came from qemu_cpu_is_self() returning false on the
++     * single WASI thread, which is now fixed in rr_start_vcpu_thread().
++     * Discarding exit requests is incorrect: async_run_on_cpu() work, such
++     * as the TLB flush queued by tcg_commit() after a PAM/memory-map change,
++     * relies on the kick to run before the next TB.  Without it the guest
++     * keeps using stale TLB entries; e.g. SeaBIOS's shadow-RAM copy went to
++     * read-only pc.rom and lost its relocation table.
++     */
++
+     /* Finally, check if we need to exit to the main loop.  */
+     if (unlikely(qatomic_read(&cpu->exit_request)) || icount_exit_request(cpu)) {
+         qatomic_set(&cpu->exit_request, 0);
+         if (cpu->exception_index == -1) {
+             cpu->exception_index = EXCP_INTERRUPT;
+         }
++#ifdef WASI_PLATFORM
++        if (hi_trace) {
++            WASI_LOG_V("WASI_HI[%d]: EXIT via exit_request/icount path\n", hi_diag);
++        }
++        hi_diag++;
++#endif
+         return true;
+     }
+ 
++#ifdef WASI_PLATFORM
++    /*
++     * Periodically yield back to the main loop so it can run timers.
++     *
++     * On WASI there is no separate vCPU thread and no TCG "kick" timer
++     * thread, so the main loop (and therefore qemu_clock_run_all_timers,
++     * which fires the PIT/RTC/HPET callbacks that raise IRQ0) only runs
++     * when cpu_exec() returns. Without this yield the guest spins forever
++     * waiting for a timer tick that can never arrive. We exit with
++     * EXCP_INTERRUPT, which the RR loop treats as a benign "vCPU yielded"
++     * result and re-enters cpu_exec after servicing the main loop.
++     */
++    {
++        /* Counted by tcg_qemu_tb_exec(); also count here, as a fallback. */
++        extern uint64_t wasi_tbs_executed, wasi_tb_yield_at;
++
++        if (++wasi_tbs_executed >= wasi_tb_yield_at) {
++            wasi_tb_yield_at = wasi_tbs_executed + WASI_TB_YIELD_SLICE;
++            if (cpu->exception_index == -1) {
++                cpu->exception_index = EXCP_INTERRUPT;
++            }
++            return true;
++        }
++    }
++#endif
+     return false;
+ }
+ 
+@@ -990,7 +1229,17 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
+                 uint32_t h;
+ 
+                 mmap_lock();
++#ifdef WASI_PLATFORM
++                {
++                    extern void wasi_prof_add_gen(int64_t ns);
++                    int64_t t = get_clock();
++
++                    tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
++                    wasi_prof_add_gen(get_clock() - t);
++                }
++#else
+                 tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
++#endif
+                 mmap_unlock();
+ 
+                 /*
+diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+index 117b516..829bfda 100644
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -1258,7 +1258,53 @@ io_prepare(hwaddr *out_offset, CPUState *cpu, hwaddr xlat,
+     mr_offset = (xlat & TARGET_PAGE_MASK) + addr;
+     cpu->mem_io_pc = retaddr;
+     if (!cpu->neg.can_do_io) {
++#ifdef WASI_PLATFORM
++        /*
++         * Non-icount WASI build: the cpu_io_recompile() "retranslate to a
++         * single-instruction TB" mechanism does not converge under the wasm
++         * JIT. The JIT caches compiled TBs by guest PC, so the cflags-specific
++         * (CF_MEMI_ONLY | 1) TB requested by cpu_io_recompile() collides with
++         * the already-cached multi-insn TB and the original is re-executed.
++         * The I/O instruction is therefore never reached at a point where
++         * can_do_io is true, producing an infinite cpu_loop_exit_noexc()
++         * storm (exception_index == -1) and the guest never makes progress.
++         *
++         * We do not use icount, so the precise-instruction-boundary guarantee
++         * that can_do_io provides is not needed: just let the I/O proceed.
++         */
++        static uint64_t wasi_io_skips = 0;
++        if (wasi_io_skips < 40 || wasi_io_skips % 1000000 == 0) {
++            const char *mrname = (section && section->mr && section->mr->name)
++                                 ? section->mr->name : "?";
++            WASI_LOG(
++                    "[WASI_IO] can_do_io=0 addr=0x%llx mr=%s off=0x%llx (#%llu)\n",
++                    (unsigned long long)addr, mrname,
++                    (unsigned long long)mr_offset,
++                    (unsigned long long)wasi_io_skips);
++#if defined(TARGET_I386)
++            if ((unsigned long long)addr >= 0x80000000ULL) {
++                CPUArchState *ioenv = cpu_env(cpu);
++                WASI_LOG(
++                        "[WASI_IO] BADADDR eip=0x%08x eax=0x%016llx ebx=0x%016llx "
++                        "ecx=0x%016llx edx=0x%016llx esi=0x%016llx edi=0x%016llx "
++                        "ebp=0x%016llx esp=0x%016llx\n",
++                        (uint32_t)ioenv->eip,
++                        (unsigned long long)ioenv->regs[R_EAX],
++                        (unsigned long long)ioenv->regs[R_EBX],
++                        (unsigned long long)ioenv->regs[R_ECX],
++                        (unsigned long long)ioenv->regs[R_EDX],
++                        (unsigned long long)ioenv->regs[R_ESI],
++                        (unsigned long long)ioenv->regs[R_EDI],
++                        (unsigned long long)ioenv->regs[R_EBP],
++                        (unsigned long long)ioenv->regs[R_ESP]);
++            }
++#endif
++        }
++        wasi_io_skips++;
++        cpu->neg.can_do_io = true;
++#else
+         cpu_io_recompile(cpu, retaddr);
++#endif
+     }
+ 
+     *out_offset = mr_offset;
+@@ -1711,6 +1757,18 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
+     /* Handle CPU specific unaligned behaviour */
+     a_bits = get_alignment_bits(l->memop);
+     if (addr & ((1 << a_bits) - 1)) {
++#ifdef WASI_PLATFORM
++        {
++            static int reported;
++            if (reported++ < 20) {
++                WASI_LOG("WASI_FAULT: unaligned addr=0x%llx oi=0x%x "
++                        "memop=0x%x mmu_idx=%d a_bits=%u type=%d ra=0x%lx\n",
++                        (unsigned long long)addr, (unsigned)oi,
++                        (unsigned)l->memop, l->mmu_idx, a_bits, (int)type,
++                        (unsigned long)ra);
++            }
++        }
++#endif
+         cpu_unaligned_access(cpu, addr, type, l->mmu_idx, ra);
+     }
+ 
+diff --git a/accel/tcg/tcg-accel-ops-rr.c b/accel/tcg/tcg-accel-ops-rr.c
+index c59c77d..a25a32a 100644
+--- a/accel/tcg/tcg-accel-ops-rr.c
++++ b/accel/tcg/tcg-accel-ops-rr.c
+@@ -36,6 +36,7 @@
+ #include "tcg-accel-ops.h"
+ #include "tcg-accel-ops-rr.h"
+ #include "tcg-accel-ops-icount.h"
++#include "sysemu/runstate.h"
+ 
+ /* Kick all RR vCPUs */
+ void rr_kick_vcpu_thread(CPUState *unused)
+@@ -316,6 +317,52 @@ void rr_start_vcpu_thread(CPUState *cpu)
+     g_assert(tcg_enabled());
+     tcg_cpu_init_cflags(cpu, false);
+ 
++#ifdef WASI_PLATFORM
++    /*
++     * WASI: no threads. Do the essential init from rr_cpu_thread_fn inline.
++     * The actual CPU execution loop is driven by wasi_rr_cpu_step() called
++     * from qemu_main_loop().
++     */
++    if (!single_tcg_cpu_thread) {
++        single_tcg_halt_cond = cpu->halt_cond;
++        single_tcg_cpu_thread = cpu->thread;
++
++        /*
++         * No rcu_register_thread() here: unlike upstream, this is not a new
++         * thread.  The single WASI thread was registered by rcu_init() at
++         * startup, and registering the same reader again would insert its
++         * list node twice, turning the RCU registry into a self-loop.
++         */
++        tcg_register_thread();
++
++        cpu->thread_id = qemu_get_thread_id();
++        /*
++         * There is no separate vCPU thread on WASI: the vCPU runs on the one
++         * and only thread, interleaved with the main loop.  Record that
++         * thread as the vCPU thread so qemu_cpu_is_self() answers correctly.
++         * Otherwise QEMU believes every call comes from a foreign thread:
++         * apic_update_irq() re-raises CPU_INTERRUPT_POLL forever and
++         * cpu_interrupt() kicks the vCPU on every call, livelocking cpu_exec.
++         */
++        qemu_thread_get_self(cpu->thread);
++        WASI_LOG("WASI_DBG: rr_start_vcpu_thread: cpu=%p thread=%p is_self=%d\n",
++                 (void *)cpu, (void *)cpu->thread, qemu_cpu_is_self(cpu));
++        cpu->neg.can_do_io = true;
++        cpu_thread_signal_created(cpu);
++        qemu_guest_random_seed_thread_part2(cpu->random_seed);
++    } else {
++        /* Subsequent CPUs share the first CPU's thread/halt_cond */
++        g_free(cpu->thread);
++        qemu_cond_destroy(cpu->halt_cond);
++        g_free(cpu->halt_cond);
++        cpu->thread = single_tcg_cpu_thread;
++        cpu->halt_cond = single_tcg_halt_cond;
++
++        cpu->thread_id = first_cpu->thread_id;
++        cpu->neg.can_do_io = 1;
++        cpu->created = true;
++    }
++#else
+     if (!single_tcg_cpu_thread) {
+         single_tcg_halt_cond = cpu->halt_cond;
+         single_tcg_cpu_thread = cpu->thread;
+@@ -338,4 +385,107 @@ void rr_start_vcpu_thread(CPUState *cpu)
+         cpu->neg.can_do_io = 1;
+         cpu->created = true;
+     }
++#endif
++}
++
++#ifdef WASI_PLATFORM
++/*
++ * wasi_rr_cpu_step: Execute one iteration of the RR CPU loop.
++ * Called from qemu_main_loop() on each main-loop tick instead of
++ * running in a separate thread.
++ */
++void wasi_rr_cpu_step(void)
++{
++    static int diag_count = 0;
++    static int exec_count = 0;
++    bool do_diag = (diag_count < 5 || (diag_count % 10000000) == 0);
++
++    CPUState *cpu = first_cpu;
++    if (!cpu) {
++        if (do_diag) {
++            WASI_LOG_V("WASI_RR[%d]: no first_cpu!\n", diag_count);
++        }
++        diag_count++;
++        return;
++    }
++    if (cpu->stopped) {
++        if (do_diag) {
++            WASI_LOG_V("WASI_RR[%d]: cpu->stopped=true\n", diag_count);
++        }
++        diag_count++;
++        return;
++    }
++
++    if (do_diag) {
++        WASI_LOG_V("WASI_RR[%d]: stop=%d halted=%d "
++                "exit_req=%d int_req=0x%x running=%d can_run=%d "
++                "work_empty=%d exec_count=%d exception_idx=%d "
++                "cpu=%p thread=%p is_self=%d\n",
++                diag_count, cpu->stop, cpu->halted,
++                cpu->exit_request, cpu->interrupt_request,
++                runstate_is_running(),
++                cpu_can_run(cpu), cpu_work_list_empty(cpu),
++                exec_count, cpu->exception_index,
++                (void *)cpu, (void *)cpu->thread, qemu_cpu_is_self(cpu));
++    }
++
++    /* BQL is already held by main_loop_wait's caller — don't re-acquire */
++
++    while (cpu && cpu_work_list_empty(cpu) && !cpu->exit_request) {
++        qatomic_set_mb(&rr_current_cpu, cpu);
++        current_cpu = cpu;
++
++        qemu_clock_enable(QEMU_CLOCK_VIRTUAL,
++                          (cpu->singlestep_enabled & SSTEP_NOTIMER) == 0);
++
++        if (cpu_can_run(cpu)) {
++            int r;
++
++            if (exec_count < 5) {
++                WASI_LOG_V("WASI_RR: about to call tcg_cpu_exec (exec #%d)\n", exec_count);
++            }
++
++            bql_unlock();
++            r = tcg_cpu_exec(cpu);
++            bql_lock();
++            exec_count++;
++
++            if (exec_count <= 5 || (exec_count % 10000000) == 0) {
++                WASI_LOG_V("WASI_RR: tcg_cpu_exec returned %d (exec #%d)\n", r, exec_count);
++            }
++
++            if (r == EXCP_DEBUG) {
++                cpu_handle_guest_debug(cpu);
++                break;
++            } else if (r == EXCP_ATOMIC) {
++                bql_unlock();
++                cpu_exec_step_atomic(cpu);
++                bql_lock();
++                break;
++            }
++        } else if (cpu->stop) {
++            if (cpu->unplug) {
++                cpu = CPU_NEXT(cpu);
++            }
++            break;
++        }
++
++        cpu = CPU_NEXT(cpu);
++    }
++
++    qatomic_set(&rr_current_cpu, NULL);
++
++    if (cpu && cpu->exit_request) {
++        qatomic_set_mb(&cpu->exit_request, 0);
++    }
++
++    /* Process pending work for all CPUs */
++    CPU_FOREACH(cpu) {
++        current_cpu = cpu;
++        qemu_wait_io_event_common(cpu);
++    }
++
++    diag_count++;
++    /* BQL remains held — caller (main_loop) expects it */
+ }
++#endif /* WASI_PLATFORM */
+diff --git a/accel/tcg/tcg-all.c b/accel/tcg/tcg-all.c
+index 2090907..50098cb 100644
+--- a/accel/tcg/tcg-all.c
++++ b/accel/tcg/tcg-all.c
+@@ -70,6 +70,15 @@ DECLARE_INSTANCE_CHECKER(TCGState, TCG_STATE,
+ 
+ static bool default_mttcg_enabled(void)
+ {
++#ifdef WASI_PLATFORM
++    /*
++     * WASI has no threads: the vCPU is driven inline from the main loop by
++     * wasi_rr_cpu_step(), which is round-robin (single-threaded) TCG.  MTTCG
++     * would "create" a vCPU thread through a pthread stub that never runs,
++     * leaving cpu->thread with a fake id so qemu_cpu_is_self() is false.
++     */
++    return false;
++#endif
+     if (icount_enabled() || TCG_OVERSIZED_GUEST) {
+         return false;
+     }
+@@ -139,6 +148,10 @@ static void tcg_set_thread(Object *obj, const char *value, Error **errp)
+     TCGState *s = TCG_STATE(obj);
+ 
+     if (strcmp(value, "multi") == 0) {
++#ifdef WASI_PLATFORM
++        error_setg(errp, "No MTTCG on WASI: there are no threads");
++        return;
++#endif
+         if (TCG_OVERSIZED_GUEST) {
+             error_setg(errp, "No MTTCG when guest word size > hosts");
+         } else if (icount_enabled()) {
+diff --git a/cpu-common.c b/cpu-common.c
+index 6b26223..d47f40e 100644
+--- a/cpu-common.c
++++ b/cpu-common.c
+@@ -146,6 +146,12 @@ void do_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data,
+ {
+     struct qemu_work_item wi;
+ 
++#ifdef WASI_PLATFORM
++    /* WASI is single-threaded — always execute inline */
++    func(cpu, data);
++    return;
++#endif
++
+     if (qemu_cpu_is_self(cpu)) {
+         func(cpu, data);
+         return;
+diff --git a/include/hw/core/tcg-cpu-ops.h b/include/hw/core/tcg-cpu-ops.h
+index 34318cf..c9947de 100644
+--- a/include/hw/core/tcg-cpu-ops.h
++++ b/include/hw/core/tcg-cpu-ops.h
+@@ -153,9 +153,16 @@ struct TCGCPUOps {
+      * @do_unaligned_access: Callback for unaligned access handling
+      * The callback must exit via raising an exception.
+      */
++#if defined(__wasi__) || defined(WASI_PLATFORM)
++    /* _Noreturn cannot be applied to function pointers in C11 */
++    void (*do_unaligned_access)(CPUState *cpu, vaddr addr,
++                                MMUAccessType access_type,
++                                int mmu_idx, uintptr_t retaddr);
++#else
+     G_NORETURN void (*do_unaligned_access)(CPUState *cpu, vaddr addr,
+                                            MMUAccessType access_type,
+                                            int mmu_idx, uintptr_t retaddr);
++#endif
+ 
+     /**
+      * @adjust_watchpoint_address: hack for cpu_check_watchpoint used by ARM
+diff --git a/system/cpus.c b/system/cpus.c
+index 1c818ff..88bacb2 100644
+--- a/system/cpus.c
++++ b/system/cpus.c
+@@ -445,7 +445,18 @@ void qemu_wait_io_event_common(CPUState *cpu)
+ {
+     qatomic_set_mb(&cpu->thread_kicked, false);
+     if (cpu->stop) {
++#ifdef WASI_PLATFORM
++        /*
++         * On WASI we drive the vCPU inline from the main loop — there is no
++         * per-cpu thread. qemu_cpu_stop()'s g_assert(qemu_cpu_is_self(cpu))
++         * would always fire. Just perform the stop semantics directly.
++         */
++        cpu->stop = false;
++        cpu->stopped = true;
++        qemu_cond_broadcast(&qemu_pause_cond);
++#else
+         qemu_cpu_stop(cpu, false);
++#endif
+     }
+     process_queued_cpu_work(cpu);
+ }
+@@ -475,7 +486,10 @@ void cpus_kick_thread(CPUState *cpu)
+     }
+     cpu->thread_kicked = true;
+ 
+-#ifndef _WIN32
++#ifdef WASI_PLATFORM
++    /* No signals/threads on WASI — kick is a no-op */
++    return;
++#elif !defined(_WIN32)
+     int err = pthread_kill(cpu->thread->thread, SIG_IPI);
+     if (err && err != ESRCH) {
+         fprintf(stderr, "qemu:%s: %s", __func__, strerror(err));
+@@ -666,11 +680,13 @@ void qemu_init_vcpu(CPUState *cpu)
+ {
+     MachineState *ms = MACHINE(qdev_get_machine());
+ 
++    WASI_LOG_V("WASI_DBG: qemu_init_vcpu: entered\n");
+     cpu->nr_cores = machine_topo_get_cores_per_socket(ms);
+     cpu->nr_threads =  ms->smp.threads;
+     cpu->stopped = true;
+     cpu->random_seed = qemu_guest_random_seed_thread_part1();
+ 
++    WASI_LOG_V("WASI_DBG: qemu_init_vcpu: before cpu_address_space_init, cpu->as=%p\n", (void*)cpu->as);
+     if (!cpu->as) {
+         /* If the target cpu hasn't set up any address spaces itself,
+          * give it the default one.
+@@ -678,14 +694,23 @@ void qemu_init_vcpu(CPUState *cpu)
+         cpu->num_ases = 1;
+         cpu_address_space_init(cpu, 0, "cpu-memory", cpu->memory);
+     }
++    WASI_LOG_V("WASI_DBG: qemu_init_vcpu: after cpu_address_space_init\n");
+ 
+     /* accelerators all implement the AccelOpsClass */
+     g_assert(cpus_accel != NULL && cpus_accel->create_vcpu_thread != NULL);
++    WASI_LOG_V("WASI_DBG: qemu_init_vcpu: before create_vcpu_thread\n");
+     cpus_accel->create_vcpu_thread(cpu);
++    WASI_LOG_V("WASI_DBG: qemu_init_vcpu: after create_vcpu_thread, cpu->created=%d\n", cpu->created);
+ 
++#ifdef WASI_PLATFORM
++    /* On WASI, create_vcpu_thread runs inline and sets cpu->created=true.
++     * No need to wait. */
++#else
+     while (!cpu->created) {
+         qemu_cond_wait(&qemu_cpu_cond, &bql);
+     }
++#endif
++    WASI_LOG_V("WASI_DBG: qemu_init_vcpu: done\n");
+ }
+ 
+ void cpu_stop_current(void)

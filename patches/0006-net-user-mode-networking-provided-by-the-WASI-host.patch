@@ -1,0 +1,235 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Abe Massry <amassry@linode.com>
+Date: Wed, 14 Oct 2026 17:34:27 -0400
+Subject: [PATCH 6/7] net: user-mode networking provided by the WASI host
+
+WASI builds have no libslirp.  Implement the "user" netdev by passing
+Ethernet frames to the host, which emulates the user network: the guest
+gets 10.0.2.15 by DHCP, 10.0.2.2 is the gateway and 10.0.2.3 the DNS
+server, and traffic is relayed through host sockets.
+
+Host imports, from "env":
+
+  host_net_send(frame, len)   pass a frame from the guest to the host
+  host_net_recv(buf, size)    fetch the next frame for the guest
+  host_net_wait(timeout_ns)   sleep until a frame arrives, or timeout
+
+There are no fds to watch, so the main loop polls with wasi_net_poll(),
+and while idle it sleeps in host_net_wait() so that replies are
+delivered at once.  Frames wait while the NIC cannot receive.  Options
+that change the network layout are rejected.
+
+The backend is included from net.c, so it needs no meson changes.
+---
+ include/net/net.h   |   4 ++
+ net/net.c           |   6 ++
+ net/wasi-user.c.inc | 161 ++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 171 insertions(+)
+ create mode 100644 net/wasi-user.c.inc
+
+diff --git a/include/net/net.h b/include/net/net.h
+index c8f6797..21f579f 100644
+--- a/include/net/net.h
++++ b/include/net/net.h
+@@ -181,6 +181,10 @@ ssize_t qemu_send_packet_async(NetClientState *nc, const uint8_t *buf,
+ void qemu_purge_queued_packets(NetClientState *nc);
+ void qemu_flush_queued_packets(NetClientState *nc);
+ void qemu_flush_or_purge_queued_packets(NetClientState *nc, bool purge);
++#if defined(WASI_PLATFORM) && !defined(CONFIG_SLIRP)
++/* Deliver frames from the WASI host's user network to the guest. */
++void wasi_net_poll(void);
++#endif
+ void qemu_set_info_str(NetClientState *nc,
+                        const char *fmt, ...) G_GNUC_PRINTF(2, 3);
+ void qemu_format_nic_info_str(NetClientState *nc, uint8_t macaddr[6]);
+diff --git a/net/net.c b/net/net.c
+index fc11251..2e548de 100644
+--- a/net/net.c
++++ b/net/net.c
+@@ -1238,6 +1238,10 @@ void qemu_create_nic_bus_devices(BusState *bus, const char *parent_type,
+     g_ptr_array_free(nic_models, true);
+ }
+ 
++#if defined(WASI_PLATFORM) && !defined(CONFIG_SLIRP)
++#include "wasi-user.c.inc"
++#endif
++
+ static int (* const net_client_init_fun[NET_CLIENT_DRIVER__MAX])(
+     const Netdev *netdev,
+     const char *name,
+@@ -1245,6 +1249,8 @@ static int (* const net_client_init_fun[NET_CLIENT_DRIVER__MAX])(
+         [NET_CLIENT_DRIVER_NIC]       = net_init_nic,
+ #ifdef CONFIG_SLIRP
+         [NET_CLIENT_DRIVER_USER]      = net_init_slirp,
++#elif defined(WASI_PLATFORM)
++        [NET_CLIENT_DRIVER_USER]      = net_init_wasi_user,
+ #endif
+         [NET_CLIENT_DRIVER_TAP]       = net_init_tap,
+         [NET_CLIENT_DRIVER_SOCKET]    = net_init_socket,
+diff --git a/net/wasi-user.c.inc b/net/wasi-user.c.inc
+new file mode 100644
+index 0000000..857a309
+--- /dev/null
++++ b/net/wasi-user.c.inc
+@@ -0,0 +1,161 @@
++/*
++ * User-mode networking (-netdev user, -nic user) for WASI builds
++ *
++ * WASI builds have no libslirp; the host runtime provides the network
++ * instead.  This backend hands every Ethernet frame the guest sends to the
++ * host, and polls the host for frames to deliver to the guest.  The host
++ * side (m-browser's qemu_net.rs) emulates the usual user-mode network:
++ * the guest gets 10.0.2.15 by DHCP, 10.0.2.2 is the gateway (the host) and
++ * 10.0.2.3 the DNS server, and traffic is relayed through host sockets.
++ *
++ * Host imports, from the "env" module:
++ *
++ *   int32_t host_net_send(const void *frame, int32_t len)
++ *       Pass one frame from the guest to the host's network.
++ *
++ *   int32_t host_net_recv(void *buf, int32_t size)
++ *       Copy the next frame for the guest into buf and return its length,
++ *       or return 0 if there is none.
++ *
++ *   void host_net_wait(int64_t timeout_ns)
++ *       Sleep for up to timeout_ns, but return as soon as a frame for the
++ *       guest is ready.
++ *
++ * There are no file descriptors to wait on, so the main loop calls
++ * wasi_net_poll() on every iteration, and sleeps with host_net_wait() while
++ * the guest is idle so that replies are delivered without delay.
++ *
++ * Included from net.c, so that adding it needs no change to the meson
++ * build (this cross build cannot be reconfigured unattended).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++extern int32_t host_net_send(const void *frame, int32_t len);
++extern int32_t host_net_recv(void *buf, int32_t size);
++extern void host_net_wait(int64_t timeout_ns);
++
++typedef struct WasiUserState {
++    NetClientState nc;
++    /*
++     * A frame is waiting in the NIC's queue because the guest's receive
++     * ring is full: fetch no more from the host until it has been taken.
++     */
++    bool blocked;
++    uint8_t buf[NET_BUFSIZE];
++} WasiUserState;
++
++/* The host provides a single network, so there is at most one backend. */
++static WasiUserState *wasi_user;
++
++static ssize_t wasi_user_receive(NetClientState *nc, const uint8_t *buf,
++                                 size_t size)
++{
++    /* Like a wire, the host network may drop a frame it cannot handle. */
++    host_net_send(buf, size);
++    return size;
++}
++
++static void wasi_user_cleanup(NetClientState *nc)
++{
++    wasi_user = NULL;
++    wasi_idle_wait = NULL;
++}
++
++static NetClientInfo net_wasi_user_info = {
++    .type = NET_CLIENT_DRIVER_USER,
++    .size = sizeof(WasiUserState),
++    .receive = wasi_user_receive,
++    .cleanup = wasi_user_cleanup,
++};
++
++static void wasi_user_send_completed(NetClientState *nc, ssize_t len)
++{
++    DO_UPCAST(WasiUserState, nc, nc)->blocked = false;
++}
++
++/* Sleep while the guest is idle, waking early when a frame arrives for it. */
++static void wasi_user_idle_wait(int64_t ns)
++{
++    if (wasi_user && wasi_user->blocked) {
++        /*
++         * The NIC has no room: waking for frames waiting at the host would
++         * only spin, as they cannot be delivered yet.
++         */
++        struct timespec ts = { .tv_sec = 0, .tv_nsec = ns };
++
++        nanosleep(&ts, NULL);
++    } else {
++        host_net_wait(ns);
++    }
++}
++
++void wasi_net_poll(void)
++{
++    WasiUserState *s = wasi_user;
++
++    while (s && !s->blocked) {
++        int32_t len = host_net_recv(s->buf, sizeof(s->buf));
++
++        if (len <= 0) {
++            break;
++        }
++        if (qemu_send_packet_async(&s->nc, s->buf, len,
++                                   wasi_user_send_completed) == 0) {
++            s->blocked = true;
++        }
++    }
++}
++
++/* The first option given that the host network does not implement. */
++static const char *wasi_user_unsupported_option(const NetdevUserOptions *u)
++{
++    return u->hostname ? "hostname" :
++           (u->has_q_restrict && u->q_restrict) ? "restrict=on" :
++           (u->has_ipv4 && !u->ipv4) ? "ipv4=off" :
++           (u->has_ipv6 && u->ipv6) ? "ipv6=on" :
++           u->ip ? "ip" :
++           u->net ? "net" :
++           u->host ? "host" :
++           u->tftp ? "tftp" :
++           u->bootfile ? "bootfile" :
++           u->dhcpstart ? "dhcpstart" :
++           u->dns ? "dns" :
++           u->dnssearch ? "dnssearch" :
++           u->domainname ? "domainname" :
++           u->ipv6_prefix ? "ipv6-prefix" :
++           u->has_ipv6_prefixlen ? "ipv6-prefixlen" :
++           u->ipv6_host ? "ipv6-host" :
++           u->ipv6_dns ? "ipv6-dns" :
++           u->smb ? "smb" :
++           u->smbserver ? "smbserver" :
++           u->hostfwd ? "hostfwd" :
++           u->guestfwd ? "guestfwd" :
++           u->tftp_server_name ? "tftp-server-name" :
++           NULL;
++}
++
++static int net_init_wasi_user(const Netdev *netdev, const char *name,
++                              NetClientState *peer, Error **errp)
++{
++    const char *unsupported;
++    NetClientState *nc;
++
++    assert(netdev->type == NET_CLIENT_DRIVER_USER);
++    unsupported = wasi_user_unsupported_option(&netdev->u.user);
++    if (unsupported) {
++        error_setg(errp, "user network option '%s' is not supported: "
++                   "the WASI host provides a fixed network", unsupported);
++        return -1;
++    }
++    if (wasi_user) {
++        error_setg(errp, "only one user network is supported");
++        return -1;
++    }
++
++    nc = qemu_new_net_client(&net_wasi_user_info, peer, "user", name);
++    qemu_set_info_str(nc, "net=10.0.2.0/24, provided by the WASI host");
++    wasi_user = DO_UPCAST(WasiUserState, nc, nc);
++    wasi_idle_wait = wasi_user_idle_wait;
++    return 0;
++}

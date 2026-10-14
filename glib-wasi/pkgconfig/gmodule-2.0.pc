@@ -1,0 +1,14 @@
+# pkg-config file for gmodule-wasi shim
+# gmodule is not supported on wasm32-wasi (no dlopen), but QEMU's meson
+# checks for it. This stub satisfies the dependency check.
+
+prefix=@GLIB_WASI_PREFIX@
+includedir=${prefix}/glib
+libdir=${prefix}
+
+Name: GModule
+Description: Stub gmodule for wasm32-wasi (no dlopen support)
+Version: 2.78.0
+Requires: glib-2.0
+Libs:
+Cflags:

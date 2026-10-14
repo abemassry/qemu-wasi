@@ -1,0 +1,14 @@
+# pkg-config file for glib-wasi shim
+# This is a minimal GLib replacement for QEMU compiled to wasm32-wasi.
+# The prefix is set by the build system (build.sh) before use.
+
+prefix=@GLIB_WASI_PREFIX@
+includedir=${prefix}/glib
+libdir=${prefix}
+
+Name: GLib
+Description: Minimal GLib shim for wasm32-wasi (QEMU)
+Version: 2.78.0
+Requires:
+Libs: -L${libdir} -lglib-wasi
+Cflags: -I${includedir} -D__wasi__ -DWASI_PLATFORM

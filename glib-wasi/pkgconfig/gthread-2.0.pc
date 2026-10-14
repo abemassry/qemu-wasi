@@ -1,0 +1,14 @@
+# pkg-config file for gthread-wasi shim
+# Threading is a no-op on wasm32-wasi (single-threaded). This stub
+# satisfies QEMU's dependency('gthread-2.0') check.
+
+prefix=@GLIB_WASI_PREFIX@
+includedir=${prefix}/glib
+libdir=${prefix}
+
+Name: GThread
+Description: Stub gthread for wasm32-wasi (single-threaded, all no-ops)
+Version: 2.78.0
+Requires: glib-2.0
+Libs:
+Cflags:

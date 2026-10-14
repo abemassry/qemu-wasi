@@ -1,0 +1,346 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Abe Massry <amassry@linode.com>
+Date: Wed, 14 Oct 2026 17:34:27 -0400
+Subject: [PATCH 4/7] util: main loop, coroutines, RCU and thread pool without
+ threads
+
+The WASI build has a single thread and no file descriptors to poll,
+and its coroutines cannot suspend (util/coroutine-wasi.c).  Adapt the
+pieces that rely on threads or on blocking:
+
+- main-loop.c: glib-wasi's GMainContext never dispatches sources, so
+  poll the main and iohandler AioContexts directly.  When every vCPU
+  is idle, sleep until the next timer deadline (at most 10 ms) instead
+  of spinning; a backend can set wasi_idle_wait to wake up early.
+  There are no signals to set up.
+- async.c: a one-shot bottom half scheduled from a coroutine runs at
+  once, so its result is ready when the coroutine "yields"; waking the
+  running coroutine is then a no-op.
+- graph-lock.c: such a bottom half may take the graph write lock in
+  coroutine context, e.g. bdrv_co_unref_child() on qcow2_do_open()'s
+  error path.  Nothing else can hold the lock then, so take it without
+  draining.  Opening a damaged qcow2 image now fails with the proper
+  error instead of an assertion failure.
+- rcu.c: the call_rcu thread never runs, so nothing queued with
+  call_rcu() was ever freed (old TB hash tables, FlatViews, ...).
+  rcu_run_callbacks_inline() runs the callbacks from the main loop.
+- thread-pool.c: run work items synchronously; there are no workers.
+---
+ block/graph-lock.c       | 16 +++++++++++
+ include/qemu/main-loop.h | 10 +++++++
+ include/qemu/rcu.h       |  9 +++++++
+ util/async.c             | 28 +++++++++++++++++++
+ util/main-loop.c         | 58 ++++++++++++++++++++++++++++++++++++++++
+ util/rcu.c               | 35 ++++++++++++++++++++++++
+ util/thread-pool.c       | 10 +++++++
+ 7 files changed, 166 insertions(+)
+
+diff --git a/block/graph-lock.c b/block/graph-lock.c
+index c81162b..d100f4e 100644
+--- a/block/graph-lock.c
++++ b/block/graph-lock.c
+@@ -110,6 +110,22 @@ void no_coroutine_fn bdrv_graph_wrlock(void)
+ {
+     GLOBAL_STATE_CODE();
+     assert(!qatomic_read(&has_writer));
++#ifdef WASI_PLATFORM
++    /*
++     * WASI runs a bottom half scheduled from a coroutine inline, inside that
++     * coroutine (see aio_bh_schedule_oneshot_full()).  So the generated
++     * wrappers of no_co_wrapper_bdrv_wrlock functions, such as
++     * bdrv_co_unref_child() on the error path of qcow2_do_open(), get here
++     * in coroutine context.  The coroutine dropped its read lock before
++     * scheduling and there is only one thread, so nothing is reading the
++     * graph: take the lock without the drain and wait, which a coroutine
++     * cannot do.
++     */
++    if (qemu_in_coroutine()) {
++        qatomic_set(&has_writer, 1);
++        return;
++    }
++#endif
+     assert(!qemu_in_coroutine());
+ 
+     /* Make sure that constantly arriving new I/O doesn't cause starvation */
+diff --git a/include/qemu/main-loop.h b/include/qemu/main-loop.h
+index 5764db1..d9f9a5e 100644
+--- a/include/qemu/main-loop.h
++++ b/include/qemu/main-loop.h
+@@ -91,6 +91,16 @@ int qemu_init_main_loop(Error **errp);
+  */
+ void main_loop_wait(int nonblocking);
+ 
++#ifdef WASI_PLATFORM
++/*
++ * How main_loop_wait() sleeps while every vCPU is idle (WASI has no fds to
++ * poll): wait up to the given number of nanoseconds.  NULL means a plain
++ * nanosleep(); a backend that can tell when work arrives sets a function
++ * that returns early instead.
++ */
++extern void (*wasi_idle_wait)(int64_t ns);
++#endif
++
+ /**
+  * qemu_get_aio_context: Return the main loop's AioContext
+  */
+diff --git a/include/qemu/rcu.h b/include/qemu/rcu.h
+index fea058a..1215cd9 100644
+--- a/include/qemu/rcu.h
++++ b/include/qemu/rcu.h
+@@ -143,6 +143,15 @@ struct rcu_head {
+ void call_rcu1(struct rcu_head *head, RCUCBFunc *func);
+ void drain_call_rcu(void);
+ 
++#ifdef __wasi__
++/*
++ * Run the callbacks queued by call_rcu() so far.  WASI builds have no
++ * threads, so the main loop calls this between iterations in place of the
++ * call_rcu thread.
++ */
++void rcu_run_callbacks_inline(void);
++#endif
++
+ /* The operands of the minus operator must have the same type,
+  * which must be the one that we specify in the cast.
+  */
+diff --git a/util/async.c b/util/async.c
+index 3e3e4fc..b04afcc 100644
+--- a/util/async.c
++++ b/util/async.c
+@@ -128,6 +128,21 @@ static QEMUBH *aio_bh_dequeue(BHList *head, unsigned *flags)
+ void aio_bh_schedule_oneshot_full(AioContext *ctx, QEMUBHFunc *cb,
+                                   void *opaque, const char *name)
+ {
++#ifdef WASI_PLATFORM
++    /*
++     * WASI synchronous coroutine support: when called from inside a
++     * coroutine (e.g., the generated block-gen.c wrappers that do
++     * aio_bh_schedule_oneshot + yield), execute the callback immediately
++     * so that the result is available before yield returns.
++     *
++     * This is safe because WASI is single-threaded and the BH callback
++     * just calls the real (non-coroutine) function and stores the result.
++     */
++    if (qemu_in_coroutine()) {
++        cb(opaque);
++        return;
++    }
++#endif
+     QEMUBH *bh;
+     bh = g_new(QEMUBH, 1);
+     *bh = (QEMUBH){
+@@ -684,6 +699,19 @@ void coroutine_fn aio_co_reschedule_self(AioContext *new_ctx)
+ 
+ void aio_co_wake(Coroutine *co)
+ {
++#ifdef WASI_PLATFORM
++    /*
++     * WASI synchronous coroutine support: when the BH callback ran
++     * inline (via aio_bh_schedule_oneshot_full), it calls aio_co_wake(co)
++     * to "resume" the coroutine. But the coroutine is already running
++     * (it hasn't actually yielded yet — yield comes after the BH).
++     * So if co == self, just return — the coroutine will continue
++     * after qemu_coroutine_yield() returns.
++     */
++    if (co == qemu_coroutine_self()) {
++        return;
++    }
++#endif
+     AioContext *ctx;
+ 
+     /* Read coroutine before co->ctx.  Matches smp_wmb in
+diff --git a/util/main-loop.c b/util/main-loop.c
+index a0386cf..39008ba 100644
+--- a/util/main-loop.c
++++ b/util/main-loop.c
+@@ -86,6 +86,10 @@ static void sigfd_handler(void *opaque)
+ 
+ static int qemu_signal_init(Error **errp)
+ {
++#ifdef WASI_PLATFORM
++    /* WASI has no signals — signal init is a no-op */
++    return 0;
++#else
+     int sigfd;
+     sigset_t set;
+ 
+@@ -118,6 +122,7 @@ static int qemu_signal_init(Error **errp)
+     qemu_set_fd_handler(sigfd, sigfd_handler, NULL, (void *)(intptr_t)sigfd);
+ 
+     return 0;
++#endif /* WASI_PLATFORM */
+ }
+ 
+ #else /* _WIN32 */
+@@ -131,6 +136,10 @@ static int qemu_signal_init(Error **errp)
+ static AioContext *qemu_aio_context;
+ static QEMUBH *qemu_notify_bh;
+ 
++#ifdef WASI_PLATFORM
++void (*wasi_idle_wait)(int64_t ns);
++#endif
++
+ static void notify_event_cb(void *opaque)
+ {
+     /* No need to do anything; this bottom half is only used to
+@@ -158,17 +167,21 @@ int qemu_init_main_loop(Error **errp)
+     int ret;
+     GSource *src;
+ 
++    WASI_LOG_V("WASI_DBG: main_loop: before init_clocks\n");
+     init_clocks(qemu_timer_notify_cb);
++    WASI_LOG_V("WASI_DBG: main_loop: after init_clocks\n");
+ 
+     ret = qemu_signal_init(errp);
+     if (ret) {
+         return ret;
+     }
++    WASI_LOG_V("WASI_DBG: main_loop: after qemu_signal_init\n");
+ 
+     qemu_aio_context = aio_context_new(errp);
+     if (!qemu_aio_context) {
+         return -EMFILE;
+     }
++    WASI_LOG_V("WASI_DBG: main_loop: after aio_context_new\n");
+     qemu_set_current_aio_context(qemu_aio_context);
+     qemu_notify_bh = qemu_bh_new(notify_event_cb, NULL);
+     gpollfds = g_array_new(FALSE, FALSE, sizeof(GPollFD));
+@@ -176,10 +189,12 @@ int qemu_init_main_loop(Error **errp)
+     g_source_set_name(src, "aio-context");
+     g_source_attach(src, NULL);
+     g_source_unref(src);
++    WASI_LOG_V("WASI_DBG: main_loop: after aio g_source_attach\n");
+     src = iohandler_get_g_source();
+     g_source_set_name(src, "io-handler");
+     g_source_attach(src, NULL);
+     g_source_unref(src);
++    WASI_LOG_V("WASI_DBG: main_loop: done\n");
+     return 0;
+ }
+ 
+@@ -586,10 +601,53 @@ void main_loop_wait(int nonblocking)
+                                       timerlistgroup_deadline_ns(
+                                           &main_loop_tlg));
+ 
++#ifdef WASI_PLATFORM
++    /*
++     * g_poll() is a stub on WASI (glib-wasi) and never waits.  When the
++     * caller is willing to block -- the WASI main loop only asks when every
++     * vCPU is idle -- sleep until the next timer deadline here instead of
++     * spinning.  Cap the sleep: host input is polled from the display
++     * refresh, and a guest interrupt may also be raised by a device.
++     */
++    if (!nonblocking) {
++        const int64_t max_idle_ns = 10 * SCALE_MS;
++        int64_t ns = timeout_ns < 0 ? max_idle_ns : MIN(timeout_ns, max_idle_ns);
++
++        if (ns > 0) {
++            extern void wasi_prof_add_idle(int64_t ns);
++            int64_t t = get_clock();
++
++            if (wasi_idle_wait) {
++                wasi_idle_wait(ns);
++            } else {
++                struct timespec ts = { .tv_sec = 0, .tv_nsec = ns };
++
++                nanosleep(&ts, NULL);
++            }
++            wasi_prof_add_idle(get_clock() - t);
++        }
++    }
++#endif
++
+     ret = os_host_main_loop_wait(timeout_ns);
+     mlpoll.state = ret < 0 ? MAIN_LOOP_POLL_ERR : MAIN_LOOP_POLL_OK;
+     notifier_list_notify(&main_loop_poll_notifiers, &mlpoll);
+ 
++#ifdef WASI_PLATFORM
++    /*
++     * QEMU normally services its AioContexts as GSources dispatched by the
++     * glib main context.  glib-wasi's GMainContext is a stub that never
++     * dispatches attached sources, so without this nothing would run main
++     * context bottom halves, fd handlers or AioContext timers.  Device
++     * models depend on those: e.g. the IDE software-reset completion
++     * (ide_bus_perform_srst) and blk_aio_prwv()'s completion callback are
++     * both bottom halves, so disk probing and every guest disk read would
++     * hang.  Poll both contexts directly, without blocking.
++     */
++    aio_poll(iohandler_get_aio_context(), false);
++    aio_poll(qemu_get_aio_context(), false);
++#endif
++
+     if (icount_enabled()) {
+         /*
+          * CPU thread can infinitely wait for event after
+diff --git a/util/rcu.c b/util/rcu.c
+index fa32c94..40fb917 100644
+--- a/util/rcu.c
++++ b/util/rcu.c
+@@ -313,6 +313,41 @@ void call_rcu1(struct rcu_head *node, void (*func)(struct rcu_head *node))
+     qemu_event_set(&rcu_call_ready_event);
+ }
+ 
++#ifdef __wasi__
++/*
++ * WASI builds have no threads: the call_rcu thread is "created" but never
++ * runs (see wasi-stubs/pthread_stubs.c), so without this every callback
++ * would stay queued forever and leak whatever it frees -- old TB hash
++ * tables after each TB buffer flush, old FlatViews after each memory map
++ * change, and so on.
++ *
++ * Called by the main loop between iterations with the BQL held, as the
++ * call_rcu thread would run the callbacks.  This thread is the only RCU
++ * reader, so once it is outside any read-side critical section a grace
++ * period has elapsed for everything queued so far.
++ */
++void rcu_run_callbacks_inline(void)
++{
++    int n = qatomic_read(&rcu_call_count);
++
++    if (n == 0 || get_ptr_rcu_reader()->depth != 0) {
++        return;
++    }
++    qatomic_sub(&rcu_call_count, n);
++    while (n > 0) {
++        struct rcu_head *node = try_dequeue();
++
++        if (!node) {
++            /* Not reached: the count only covers enqueued nodes. */
++            qatomic_add(&rcu_call_count, n);
++            break;
++        }
++        n--;
++        node->func(node);
++    }
++}
++#endif
++
+ 
+ struct rcu_drain {
+     struct rcu_head rcu;
+diff --git a/util/thread-pool.c b/util/thread-pool.c
+index 27eb777..1d396ef 100644
+--- a/util/thread-pool.c
++++ b/util/thread-pool.c
+@@ -283,11 +283,21 @@ static void thread_pool_co_cb(void *opaque, int ret)
+ 
+ int coroutine_fn thread_pool_submit_co(ThreadPoolFunc *func, void *arg)
+ {
++#ifdef WASI_PLATFORM
++    /*
++     * WASI is single-threaded — no worker threads exist.
++     * Execute the work function synchronously instead of submitting
++     * to the thread pool and yielding (which would abort).
++     * The work function (e.g. handle_aiocb_rw) is just a pread/pwrite wrapper.
++     */
++    return func(arg);
++#else
+     ThreadPoolCo tpc = { .co = qemu_coroutine_self(), .ret = -EINPROGRESS };
+     assert(qemu_in_coroutine());
+     thread_pool_submit_aio(func, arg, thread_pool_co_cb, &tpc);
+     qemu_coroutine_yield();
+     return tpc.ret;
++#endif
+ }
+ 
+ void thread_pool_submit(ThreadPoolFunc *func, void *arg)
