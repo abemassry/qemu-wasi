@@ -10,21 +10,23 @@ server, and traffic is relayed through host sockets.
 
 Host imports, from "env":
 
-  host_net_send(frame, len)   pass a frame from the guest to the host
-  host_net_recv(buf, size)    fetch the next frame for the guest
-  host_net_wait(timeout_ns)   sleep until a frame arrives, or timeout
+  host_net_send(frame, len)    pass a frame from the guest to the host
+  host_net_recv(buf, size)     fetch the next frame for the guest
+  host_net_wait(timeout_ns)    sleep until a frame arrives, or timeout
+  host_net_hostfwd(rule, len)  forward a host port into the guest
 
 There are no fds to watch, so the main loop polls with wasi_net_poll(),
 and while idle it sleeps in host_net_wait() so that replies are
-delivered at once.  Frames wait while the NIC cannot receive.  Options
-that change the network layout are rejected.
+delivered at once.  Frames wait while the NIC cannot receive.  hostfwd
+rules are handed to the host; other options that change the network
+layout are rejected.
 
 The backend is included from net.c, so it needs no meson changes.
 ---
- include/net/net.h   |   4 ++
+ include/net/net.h   |   4 +
  net/net.c           |   6 ++
- net/wasi-user.c.inc | 161 ++++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 171 insertions(+)
+ net/wasi-user.c.inc | 175 ++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 185 insertions(+)
  create mode 100644 net/wasi-user.c.inc
 
 diff --git a/include/net/net.h b/include/net/net.h
@@ -68,10 +70,10 @@ index fc11251..2e548de 100644
          [NET_CLIENT_DRIVER_SOCKET]    = net_init_socket,
 diff --git a/net/wasi-user.c.inc b/net/wasi-user.c.inc
 new file mode 100644
-index 0000000..857a309
+index 0000000..cd90662
 --- /dev/null
 +++ b/net/wasi-user.c.inc
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,175 @@
 +/*
 + * User-mode networking (-netdev user, -nic user) for WASI builds
 + *
@@ -95,6 +97,11 @@ index 0000000..857a309
 + *       Sleep for up to timeout_ns, but return as soon as a frame for the
 + *       guest is ready.
 + *
++ *   int32_t host_net_hostfwd(const char *rule, int32_t len)
++ *       Forward a host port into the guest, for a hostfwd option:
++ *       "[tcp]:[hostaddr]:hostport-[guestaddr]:guestport".  Returns 0, or
++ *       -1 after printing why the rule cannot be used.
++ *
 + * There are no file descriptors to wait on, so the main loop calls
 + * wasi_net_poll() on every iteration, and sleeps with host_net_wait() while
 + * the guest is idle so that replies are delivered without delay.
@@ -108,6 +115,7 @@ index 0000000..857a309
 +extern int32_t host_net_send(const void *frame, int32_t len);
 +extern int32_t host_net_recv(void *buf, int32_t size);
 +extern void host_net_wait(int64_t timeout_ns);
++extern int32_t host_net_hostfwd(const char *rule, int32_t len);
 +
 +typedef struct WasiUserState {
 +    NetClientState nc;
@@ -203,7 +211,6 @@ index 0000000..857a309
 +           u->ipv6_dns ? "ipv6-dns" :
 +           u->smb ? "smb" :
 +           u->smbserver ? "smbserver" :
-+           u->hostfwd ? "hostfwd" :
 +           u->guestfwd ? "guestfwd" :
 +           u->tftp_server_name ? "tftp-server-name" :
 +           NULL;
@@ -214,6 +221,7 @@ index 0000000..857a309
 +{
 +    const char *unsupported;
 +    NetClientState *nc;
++    StringList *fwd;
 +
 +    assert(netdev->type == NET_CLIENT_DRIVER_USER);
 +    unsupported = wasi_user_unsupported_option(&netdev->u.user);
@@ -225,6 +233,14 @@ index 0000000..857a309
 +    if (wasi_user) {
 +        error_setg(errp, "only one user network is supported");
 +        return -1;
++    }
++    for (fwd = netdev->u.user.hostfwd; fwd; fwd = fwd->next) {
++        const char *rule = fwd->value->str;
++
++        if (host_net_hostfwd(rule, strlen(rule)) != 0) {
++            error_setg(errp, "could not set up host forwarding rule '%s'", rule);
++            return -1;
++        }
 +    }
 +
 +    nc = qemu_new_net_client(&net_wasi_user_info, peer, "user", name);

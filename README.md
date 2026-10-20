@@ -19,15 +19,17 @@ on a 20-thread x86-64 Linux host:
 - Keyboard and mouse (absolute pointer through a USB tablet). The QEMU
   monitor and the guest's serial port are text consoles: Ctrl+Alt+1/2/3
   switch between the guest display, the monitor and the serial console.
-- User-mode networking: DHCP, DNS, ping and UDP. TCP is not relayed yet;
-  connections are refused at once.
+- User-mode networking, as with QEMU's usual `-nic user`: DHCP, DNS, TCP,
+  UDP and ping. The guest browses the web, and installs packages with
+  apk. Host ports can be forwarded into the guest (`hostfwd`), e.g. for
+  ssh.
 - A differential test of 353 x86 instruction forms gives the same results
   as native QEMU (`make test`).
 
-Limitations: one vCPU, and no threads anywhere; no TCP yet; no QMP (the
-HMP monitor works); no audio. Under Xorg, disable glamor acceleration in
-the guest (see [Guest setup](#guest-setup)), otherwise X takes half an
-hour to start.
+Limitations: one vCPU, and no threads anywhere; no IPv6 networking, and
+no UDP port forwarding; no QMP (the HMP monitor works); no audio. Under
+Xorg, disable glamor acceleration in the guest (see [Guest
+setup](#guest-setup)), otherwise X takes half an hour to start.
 
 ## How it works
 
@@ -64,7 +66,10 @@ blitting them with softbuffer.
 the host (`host_net_*()`), which emulates the network that libslirp
 normally provides: the guest gets 10.0.2.15 by DHCP, 10.0.2.2 is the
 gateway and 10.0.2.3 the DNS server, and traffic goes out through host
-sockets.
+sockets. The guest's TCP connections end in a TCP/IP stack on the host
+([smoltcp](https://github.com/smoltcp-rs/smoltcp)) that answers for any
+address, and their data is relayed through host TCP sockets; slirp
+works the same way.
 
 ### Host interface
 
@@ -82,6 +87,7 @@ Imports, all from module `env`:
 | `host_net_send(frame, len)` | send an Ethernet frame from the guest |
 | `host_net_recv(buf, size) -> len` | receive the next frame for the guest (0: none) |
 | `host_net_wait(timeout_ns)` | sleep until a frame arrives, or the timeout |
+| `host_net_hostfwd(rule, len) -> 0 or -1` | forward a host port into the guest, for a `hostfwd` rule |
 
 Plus `wasi_snapshot_preview1` (files, clocks, random, args, environment).
 
@@ -93,7 +99,8 @@ a Store move), `wasi_qemu_quit()` (power off and close the disk images
 cleanly), and `memory` and `__indirect_function_table`.
 
 The host side is in m-browser: `src/qemu_jit.rs`, `src/qemu_gfx.rs`,
-`src/qemu_net.rs` and `run_qemu_reactor()` in `src/wasm.rs`.
+`src/qemu_net.rs` (and `src/qemu_net/tcp.rs`) and `run_qemu_reactor()` in
+`src/wasm.rs`.
 
 ## Repository layout
 
@@ -153,6 +160,19 @@ m-browser starts QEMU with:
 where `/bios` is `m-browser/pc-bios` and `/data` is m-browser's working
 directory.
 
+To forward host ports into the guest, replace `-nic user` by setting
+`QEMU_NIC`, with rules in QEMU's
+`hostfwd=[tcp]:[hostaddr]:hostport-[guestaddr]:guestport` form. For
+example, to reach the guest's ssh server:
+
+```sh
+QEMU_NIC=user,hostfwd=tcp:127.0.0.1:2222-:22 target/release/m-browser
+ssh -p 2222 user@127.0.0.1
+```
+
+Without a host address, a forwarded port listens on all of the host's
+network interfaces.
+
 There is also a headless runner for testing and debugging, which can type,
 click, and save the screen to a PNG (see `src/headless.rs` in m-browser):
 
@@ -193,7 +213,8 @@ m-browser passes `QEMU_*` and `WASI_*` variables through to QEMU.
 | `WASI_DEBUG=1`, `2` | trace startup (1), and every TB (2: very slow) |
 | `WASI_GFX_SCALE=<n>`, `WASI_GFX_CONSOLE=<n>`, `WASI_GFX_FULL_REFRESH=1` | display: zoom factor, initial console, redraw every frame |
 
-Read by m-browser itself: `QEMU_NET_DEBUG=1` (log the network traffic),
+Read by m-browser itself: `QEMU_NIC` (the `-nic` option, default `user`;
+see [Running](#running)), `QEMU_NET_DEBUG=1` (log the network traffic),
 `QEMU_JIT_STATS=1`, `QEMU_WASM_OPT=speed` (optimize compiled code more),
 and for the headless runner `QEMU_SNAPSHOT`, `QEMU_TYPE`,
 `QEMU_TYPE_FIFO` and `QEMU_QUIT_AFTER`.
