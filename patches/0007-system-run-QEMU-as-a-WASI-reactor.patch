@@ -31,9 +31,9 @@ the only way to free compiled TB modules.  Exports (system/main.c):
  include/sysemu/sysemu.h |   3 +
  monitor/monitor.c       |  12 ++++
  system/main.c           |  77 ++++++++++++++++++++++
- system/runstate.c       | 137 ++++++++++++++++++++++++++++++++++++++++
+ system/runstate.c       | 138 ++++++++++++++++++++++++++++++++++++++++
  system/vl.c             | 117 +++++++++++++++++++++++++++++++++-
- 5 files changed, 343 insertions(+), 3 deletions(-)
+ 5 files changed, 344 insertions(+), 3 deletions(-)
 
 diff --git a/include/sysemu/sysemu.h b/include/sysemu/sysemu.h
 index 5b4397e..8e31fc1 100644
@@ -163,7 +163,7 @@ index 9b91d21..7536fc4 100644
      return qemu_main();
  }
 diff --git a/system/runstate.c b/system/runstate.c
-index a0e2a5f..da4e14b 100644
+index a0e2a5f..c87c977 100644
 --- a/system/runstate.c
 +++ b/system/runstate.c
 @@ -45,6 +45,7 @@
@@ -215,7 +215,7 @@ index a0e2a5f..da4e14b 100644
  }
  
  /*
-@@ -818,6 +829,131 @@ static bool main_loop_should_exit(int *status)
+@@ -818,6 +829,132 @@ static bool main_loop_should_exit(int *status)
      return false;
  }
  
@@ -314,22 +314,23 @@ index a0e2a5f..da4e14b 100644
 +    }
 +    extern void wasi_prof_add_loop(int64_t loop_ns, int64_t cpu_ns);
 +    extern void wasi_prof_report_maybe(void);
++    extern int64_t wasi_prof_clock(void);
 +    int64_t t0, t1, t2;
 +
 +    wasi_status_dump();
 +    wasi_prof_report_maybe();
-+    t0 = get_clock();
++    t0 = wasi_prof_clock();
 +    /* Only wait for timers when no vCPU has anything to do. */
 +    main_loop_wait(!all_cpu_threads_idle());
 +#ifndef CONFIG_SLIRP
 +    /* Hand frames from the host's user network to the NIC (net/wasi-user.c.inc). */
 +    wasi_net_poll();
 +#endif
-+    t1 = get_clock();
++    t1 = wasi_prof_clock();
 +    wasi_rr_cpu_step();
 +    /* No RCU reader is active between iterations (see rcu.c). */
 +    rcu_run_callbacks_inline();
-+    t2 = get_clock();
++    t2 = wasi_prof_clock();
 +    wasi_prof_add_loop(t1 - t0, t2 - t1);
 +    return false;
 +}
@@ -347,7 +348,7 @@ index a0e2a5f..da4e14b 100644
  int qemu_main_loop(void)
  {
      int status = EXIT_SUCCESS;
-@@ -828,6 +964,7 @@ int qemu_main_loop(void)
+@@ -828,6 +965,7 @@ int qemu_main_loop(void)
  
      return status;
  }

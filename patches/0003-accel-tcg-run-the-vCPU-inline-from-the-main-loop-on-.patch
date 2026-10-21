@@ -15,7 +15,10 @@ through wasi_rr_cpu_step().
 - tcg-all.c: no MTTCG; there is a single thread.
 - cpu-exec.c: as no timer thread kicks the vCPU, return to the main
   loop periodically so that timers, and the IRQs they raise, are
-  serviced.
+  serviced.  A busy guest's timer tick is due at nearly every return,
+  and a tick costs it a couple of thousand TBs, so slices are timed
+  (QEMU_TB_SLICE_MS, default 30 ms): with slices of 4000 TBs, ticks
+  took about half of the guest's time.
 - cputlb.c: let I/O accesses proceed instead of retranslating a
   single-instruction TB (cpu_io_recompile()), which never converged
   here; without icount the exact instruction boundary is not needed.
@@ -30,17 +33,17 @@ CPU state on the n-th run of a TB; QEMU_LOOP_DIAG=1 turns on TCG
 logging when the same TB runs a million times in a row; the
 QEMU_STATUS_EVERY report includes the most recently executed TBs.
 ---
- accel/tcg/cpu-exec.c          | 251 +++++++++++++++++++++++++++++++++-
+ accel/tcg/cpu-exec.c          | 257 +++++++++++++++++++++++++++++++++-
  accel/tcg/cputlb.c            |  58 ++++++++
- accel/tcg/tcg-accel-ops-rr.c  | 150 ++++++++++++++++++++
+ accel/tcg/tcg-accel-ops-rr.c  | 156 +++++++++++++++++++++
  accel/tcg/tcg-all.c           |  13 ++
  cpu-common.c                  |   6 +
  include/hw/core/tcg-cpu-ops.h |   7 +
  system/cpus.c                 |  27 +++-
- 7 files changed, 510 insertions(+), 2 deletions(-)
+ 7 files changed, 522 insertions(+), 2 deletions(-)
 
 diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
-index 8163295..4f7fe5a 100644
+index 8163295..849c409 100644
 --- a/accel/tcg/cpu-exec.c
 +++ b/accel/tcg/cpu-exec.c
 @@ -286,6 +286,98 @@ hit:
@@ -284,7 +287,7 @@ index 8163295..4f7fe5a 100644
          if (unlikely(cpu->singlestep_enabled & SSTEP_NOIRQ)) {
              /* Mask out external interrupts for this step. */
              interrupt_request &= ~CPU_INTERRUPT_SSTEP_MASK;
-@@ -888,15 +1084,58 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
+@@ -888,15 +1084,63 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
          bql_unlock();
      }
  
@@ -330,9 +333,14 @@ index 8163295..4f7fe5a 100644
 +    {
 +        /* Counted by tcg_qemu_tb_exec(); also count here, as a fallback. */
 +        extern uint64_t wasi_tbs_executed, wasi_tb_yield_at;
++        extern uint64_t wasi_tb_yield_slice(void);
++        extern bool wasi_slice_over(void);
 +
 +        if (++wasi_tbs_executed >= wasi_tb_yield_at) {
-+            wasi_tb_yield_at = wasi_tbs_executed + WASI_TB_YIELD_SLICE;
++            wasi_tb_yield_at = wasi_tbs_executed + wasi_tb_yield_slice();
++            if (!wasi_slice_over()) {
++                return false;
++            }
 +            if (cpu->exception_index == -1) {
 +                cpu->exception_index = EXCP_INTERRUPT;
 +            }
@@ -343,17 +351,18 @@ index 8163295..4f7fe5a 100644
      return false;
  }
  
-@@ -990,7 +1229,17 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
+@@ -990,7 +1234,18 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                  uint32_t h;
  
                  mmap_lock();
 +#ifdef WASI_PLATFORM
 +                {
 +                    extern void wasi_prof_add_gen(int64_t ns);
-+                    int64_t t = get_clock();
++                    extern int64_t wasi_prof_clock(void);
++                    int64_t t = wasi_prof_clock();
 +
 +                    tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
-+                    wasi_prof_add_gen(get_clock() - t);
++                    wasi_prof_add_gen(wasi_prof_clock() - t);
 +                }
 +#else
                  tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
@@ -439,7 +448,7 @@ index 117b516..829bfda 100644
      }
  
 diff --git a/accel/tcg/tcg-accel-ops-rr.c b/accel/tcg/tcg-accel-ops-rr.c
-index c59c77d..a25a32a 100644
+index c59c77d..576e46f 100644
 --- a/accel/tcg/tcg-accel-ops-rr.c
 +++ b/accel/tcg/tcg-accel-ops-rr.c
 @@ -36,6 +36,7 @@
@@ -503,7 +512,7 @@ index c59c77d..a25a32a 100644
      if (!single_tcg_cpu_thread) {
          single_tcg_halt_cond = cpu->halt_cond;
          single_tcg_cpu_thread = cpu->thread;
-@@ -338,4 +385,107 @@ void rr_start_vcpu_thread(CPUState *cpu)
+@@ -338,4 +385,113 @@ void rr_start_vcpu_thread(CPUState *cpu)
          cpu->neg.can_do_io = 1;
          cpu->created = true;
      }
@@ -568,6 +577,12 @@ index c59c77d..a25a32a 100644
 +            }
 +
 +            bql_unlock();
++            {
++                /* The vCPU runs for a slice (see tcg/wasm32.c). */
++                extern void wasi_slice_begin(void);
++
++                wasi_slice_begin();
++            }
 +            r = tcg_cpu_exec(cpu);
 +            bql_lock();
 +            exec_count++;

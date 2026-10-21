@@ -152,7 +152,7 @@ or the browser shuts QEMU down cleanly; the guest sees a power cut.
 m-browser starts QEMU with:
 
 ```
--L /bios -drive file=/data/m.qcow2,format=qcow2 -m 512
+-L /bios -drive file=/data/m.qcow2,format=qcow2 -m 1024
 -accel tcg,tb-size=256 -device qemu-xhci -device usb-tablet
 -monitor vc -serial vc -nic user
 ```
@@ -194,7 +194,9 @@ EndSection
 ```
 
 Give the guest at least 512 MB: with less, a desktop swaps constantly, and
-the guest kernel drops keystrokes.
+the guest kernel drops keystrokes. Starting Chromium needs about 1 GB: with
+512 MB it pushes ~100 MB to swap, and the guest kernel spends a sixth of its
+time reclaiming and compacting memory.
 
 ### Environment variables
 
@@ -204,6 +206,9 @@ m-browser passes `QEMU_*` and `WASI_*` variables through to QEMU.
 |---|---|
 | `QEMU_JIT_HOT=<n>` | interpreted runs before a TB is compiled (default 5000; 0 compiles at once) |
 | `QEMU_JIT_WARM=<n>` | runs before a TB whose module the host still has is reloaded (default 50) |
+| `QEMU_JIT_ASYNC=0` | compile hot TBs synchronously, instead of in the background while they stay interpreted |
+| `QEMU_TB_SLICE_MS=<ms>` | how long the vCPU runs between main loop iterations (default 30); each one also costs a busy guest a timer tick |
+| `QEMU_TB_SLICE=<n>` | count slices in TBs instead (formerly fixed at 4000) |
 | `QEMU_PROF_EVERY=<s>` | print a time profile every s seconds |
 | `QEMU_STATUS_EVERY=<s>` | print the vCPU state and recent TBs every s seconds |
 | `QEMU_TB_DUMP=<pc>,<dir>` | save the wasm module of the TB at guest pc |
@@ -215,9 +220,12 @@ m-browser passes `QEMU_*` and `WASI_*` variables through to QEMU.
 
 Read by m-browser itself: `QEMU_NIC` (the `-nic` option, default `user`;
 see [Running](#running)), `QEMU_NET_DEBUG=1` (log the network traffic),
-`QEMU_JIT_STATS=1`, `QEMU_WASM_OPT=speed` (optimize compiled code more),
-and for the headless runner `QEMU_SNAPSHOT`, `QEMU_TYPE`,
-`QEMU_TYPE_FIFO` and `QEMU_QUIT_AFTER`.
+`QEMU_JIT_STATS=1` (JIT statistics every minute), `QEMU_JIT_THREADS=<n>`
+(background compiler threads, default a quarter of the CPUs, at most 4),
+`QEMU_JIT_DUMP=<dir>[,<n>]` (save every n-th compiled TB module),
+`QEMU_WASM_OPT=speed` (optimize compiled code more), `QEMU_PROFILE=1` (sample
+where QEMU spends its time), and for the headless runner `QEMU_SNAPSHOT`,
+`QEMU_TYPE`, `QEMU_TYPE_FIFO` and `QEMU_QUIT_AFTER`.
 
 ## Changing QEMU
 

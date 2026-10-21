@@ -28,12 +28,12 @@ pieces that rely on threads or on blocking:
 ---
  block/graph-lock.c       | 16 +++++++++++
  include/qemu/main-loop.h | 10 +++++++
- include/qemu/rcu.h       |  9 +++++++
+ include/qemu/rcu.h       |  9 ++++++
  util/async.c             | 28 +++++++++++++++++++
- util/main-loop.c         | 58 ++++++++++++++++++++++++++++++++++++++++
+ util/main-loop.c         | 59 ++++++++++++++++++++++++++++++++++++++++
  util/rcu.c               | 35 ++++++++++++++++++++++++
  util/thread-pool.c       | 10 +++++++
- 7 files changed, 166 insertions(+)
+ 7 files changed, 167 insertions(+)
 
 diff --git a/block/graph-lock.c b/block/graph-lock.c
 index c81162b..d100f4e 100644
@@ -150,7 +150,7 @@ index 3e3e4fc..b04afcc 100644
  
      /* Read coroutine before co->ctx.  Matches smp_wmb in
 diff --git a/util/main-loop.c b/util/main-loop.c
-index a0386cf..39008ba 100644
+index a0386cf..b66a950 100644
 --- a/util/main-loop.c
 +++ b/util/main-loop.c
 @@ -86,6 +86,10 @@ static void sigfd_handler(void *opaque)
@@ -218,7 +218,7 @@ index a0386cf..39008ba 100644
      return 0;
  }
  
-@@ -586,10 +601,53 @@ void main_loop_wait(int nonblocking)
+@@ -586,10 +601,54 @@ void main_loop_wait(int nonblocking)
                                        timerlistgroup_deadline_ns(
                                            &main_loop_tlg));
  
@@ -236,7 +236,8 @@ index a0386cf..39008ba 100644
 +
 +        if (ns > 0) {
 +            extern void wasi_prof_add_idle(int64_t ns);
-+            int64_t t = get_clock();
++            extern int64_t wasi_prof_clock(void);
++            int64_t t = wasi_prof_clock();
 +
 +            if (wasi_idle_wait) {
 +                wasi_idle_wait(ns);
@@ -245,7 +246,7 @@ index a0386cf..39008ba 100644
 +
 +                nanosleep(&ts, NULL);
 +            }
-+            wasi_prof_add_idle(get_clock() - t);
++            wasi_prof_add_idle(wasi_prof_clock() - t);
 +        }
 +    }
 +#endif
