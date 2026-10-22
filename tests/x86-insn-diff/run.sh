@@ -40,7 +40,7 @@ gcc -O1 -fno-tree-vectorize -ffreestanding -fno-pic -no-pie -nostdlib -static \
     "$src/tests/tcg/x86_64/system/boot.S" "$here/insn-test.c" \
     "$out/printf.o" -lgcc -o "$out/insn-test.elf"
 
-common="-M pc -cpu max -m 64 -no-reboot -monitor none -serial none"
+common="-M pc -cpu max -m 64 -smp 1 -no-reboot -monitor none -serial none"
 
 rm -f "$out/native.txt" "$out/wasm.txt"
 timeout 120 "$native" $common -display none \

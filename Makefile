@@ -1,6 +1,8 @@
 # qemu-wasi: QEMU compiled to WebAssembly (WASI), shown through wasi-gfx.
 #
 #   make                 fetch QEMU, apply patches/, build qemu-build/qemu-system-x86_64
+#   make THREADS=1       the multi-threaded build instead (one thread per vCPU),
+#                        in qemu-build-threads/; also for install and test
 #   make install         copy it into m-browser (M_BROWSER, default ../m-browser)
 #   make native          build a native QEMU from the same tree, for make test
 #   make test            compare x86 instruction results with the native QEMU
@@ -14,13 +16,21 @@
 WASI_SDK  ?= /opt/wasi-sdk
 M_BROWSER ?= $(CURDIR)/../m-browser
 NINJA     ?= ninja
-export WASI_SDK M_BROWSER
+THREADS   ?= 0
+export WASI_SDK M_BROWSER THREADS
+
+ifeq ($(THREADS),1)
+VARIANT    := -threads
+else
+VARIANT    :=
+endif
 
 QEMU_SRC   := qemu-src
-QEMU_BUILD := qemu-build
+QEMU_BUILD := qemu-build$(VARIANT)
 QEMU_WASM  := $(QEMU_BUILD)/qemu-system-x86_64
 PATCHED    := $(QEMU_SRC)/.git/qemu-wasi-patched
-LIBS       := glib-wasi/libglib-wasi.a wasi-stubs/libwasi-stubs.a zlib-wasi/lib/libz.a
+ZLIB       := zlib-wasi$(VARIANT)/lib/libz.a
+LIBS       := glib-wasi/libglib-wasi$(VARIANT).a wasi-stubs/libwasi-stubs$(VARIANT).a $(ZLIB)
 
 .PHONY: all libs install native test reset-qemu export-patches clean distclean
 
@@ -33,11 +43,11 @@ all: $(QEMU_BUILD)/build.ninja libs
 	$(NINJA) -C $(QEMU_BUILD) qemu-system-x86_64
 	@ls -l $(QEMU_WASM)
 
-libs: zlib-wasi/lib/libz.a
-	$(MAKE) -C glib-wasi
-	$(MAKE) -C wasi-stubs
+libs: $(ZLIB)
+	$(MAKE) -C glib-wasi THREADS=$(THREADS)
+	$(MAKE) -C wasi-stubs THREADS=$(THREADS)
 
-zlib-wasi/lib/libz.a:
+$(ZLIB):
 	scripts/build-zlib.sh
 
 $(PATCHED): $(wildcard patches/*.patch)
@@ -59,7 +69,7 @@ native: $(PATCHED)
 	$(NINJA) -C qemu-native qemu-system-x86_64
 
 test:
-	tests/x86-insn-diff/run.sh
+	QEMU_WASM=$(CURDIR)/$(QEMU_WASM) tests/x86-insn-diff/run.sh
 
 reset-qemu:
 	scripts/fetch-qemu.sh --reset
@@ -69,8 +79,8 @@ export-patches:
 
 clean:
 	rm -rf $(QEMU_BUILD)
-	$(MAKE) -C glib-wasi clean
-	$(MAKE) -C wasi-stubs clean
+	$(MAKE) -C glib-wasi clean THREADS=$(THREADS)
+	$(MAKE) -C wasi-stubs clean THREADS=$(THREADS)
 
 distclean: clean
-	rm -rf $(QEMU_SRC) qemu-native zlib-src zlib-wasi
+	rm -rf $(QEMU_SRC) qemu-native zlib-src zlib-wasi zlib-wasi-threads

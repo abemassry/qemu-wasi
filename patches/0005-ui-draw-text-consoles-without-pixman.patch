@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Abe Massry <amassry@linode.com>
 Date: Wed, 14 Oct 2026 17:34:27 -0400
-Subject: [PATCH 5/7] ui: draw text consoles without pixman
+Subject: [PATCH 5/8] ui: draw text consoles without pixman
 
 There is no pixman for WASI.  include/ui/pixman-minimal.h implements
 the part of its API that ui/console-vc.c and ui/qemu-pixman.c use:

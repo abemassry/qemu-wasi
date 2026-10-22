@@ -38,10 +38,9 @@ DISPLAY_DEFINES = ["-DQEMU_BUILD"]
 # Flags wasm-ld does not understand.
 DROP_FLAGS = ["-Wl,--start-group", "-Wl,--end-group", "-pthread"]
 
-# Flags the wasm build needs but meson does not emit.
+# Flags the wasm build needs but meson does not emit.  libsetjmp.a is
+# added per target (see link_flags()).
 EXTRA_LINK_FLAGS = [
-    # setjmp/longjmp support for -mllvm -wasm-enable-sjlj.
-    str(WASI_SDK / "share/wasi-sysroot/lib/wasm32-wasip1/libsetjmp.a"),
     # The host adds each compiled TB's entry function to QEMU's function
     # table, so the table must be exported and growable.
     "-Wl,--export-table",
@@ -55,6 +54,29 @@ EXTRA_LINK_FLAGS = [
     # regains control between main loop iterations.
     "-mexec-model=reactor",
 ]
+
+
+# The multi-threaded build (wasm32-wasip1-threads; THREADS=1 in the
+# Makefile) also needs: its memory imported from the host, which creates it
+# shared between the threads, and exported, for the host's WASI functions;
+# and room for the threads' stacks and the guest's RAM.
+THREADS_LINK_FLAGS = [
+    "-Wl,--import-memory",
+    "-Wl,--export-memory",
+    "-Wl,--max-memory=4294967296",
+]
+
+
+def link_flags(text: str):
+    """The extra link flags for the target build.ninja compiles for."""
+    threads = "wasm32-wasip1-threads-clang" in text
+    target = "wasm32-wasip1-threads" if threads else "wasm32-wasip1"
+    # setjmp/longjmp support for -mllvm -wasm-enable-sjlj.
+    flags = [str(WASI_SDK / f"share/wasi-sysroot/lib/{target}/libsetjmp.a")]
+    flags += EXTRA_LINK_FLAGS
+    if threads:
+        flags += THREADS_LINK_FLAGS
+    return flags
 
 
 def ninja_path(path) -> str:
@@ -142,7 +164,7 @@ def patch(text: str):
             args = [a for a in args if a not in DROP_FLAGS]
             notes.append(f"removed unsupported link flags: {', '.join(removed)}")
 
-        added = [f for f in EXTRA_LINK_FLAGS if f not in args]
+        added = [f for f in link_flags(text) if f not in args]
         if added:
             args += added
             notes.append(f"appended wasm link flags: {', '.join(added)}")

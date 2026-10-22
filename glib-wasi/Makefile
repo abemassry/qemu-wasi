@@ -11,23 +11,33 @@
 # -----------------------------------------------------------------------
 
 WASI_SDK  ?= /opt/wasi-sdk
-CC         = $(WASI_SDK)/bin/wasm32-wasip2-clang
 AR         = $(WASI_SDK)/bin/ar
 
+# THREADS=1: for QEMU's multi-threaded build (wasm32-wasip1-threads), with
+# real locks; built separately, as libglib-wasi-threads.a.
+THREADS   ?= 0
+ifeq ($(THREADS),1)
+CC         = $(WASI_SDK)/bin/wasm32-wasip1-threads-clang
+CFLAGS    := -O2 -Wall -D__wasi__ -DWASI_PLATFORM -DWASI_THREADS -pthread -I$(CURDIR)
+VARIANT   := -threads
+else
+CC         = $(WASI_SDK)/bin/wasm32-wasip2-clang
 CFLAGS    := -O2 -Wall -D__wasi__ -DWASI_PLATFORM -I$(CURDIR)
+VARIANT   :=
+endif
 
 # -----------------------------------------------------------------------
 #  Source / object lists
 # -----------------------------------------------------------------------
 
 SRCDIR    := src
-BUILDDIR  := build
+BUILDDIR  := build$(VARIANT)
 
 SRCS      := $(wildcard $(SRCDIR)/*.c)
 OBJS      := $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SRCS))
 DEPS      := $(OBJS:.o=.d)
 
-LIB       := libglib-wasi.a
+LIB       := libglib-wasi$(VARIANT).a
 
 # -----------------------------------------------------------------------
 #  Header list (for dependency tracking fallback)

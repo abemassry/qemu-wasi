@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Abe Massry <amassry@linode.com>
 Date: Wed, 14 Oct 2026 17:34:27 -0400
-Subject: [PATCH 2/7] tcg/wasm32: add a WebAssembly backend for WASI hosts
+Subject: [PATCH 2/8] tcg/wasm32: add a WebAssembly backend for WASI hosts
 
 Add a TCG backend that turns each translation block into a small
 WebAssembly module.  It is based on Kohei Tokunaga's Emscripten

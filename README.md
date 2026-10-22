@@ -142,6 +142,27 @@ make install    # copy qemu-build/qemu-system-x86_64 into ../m-browser
 The result is `qemu-build/qemu-system-x86_64`, a ~40 MB wasm module.
 `M_BROWSER=/path/to/m-browser make install` installs it elsewhere.
 
+### The multi-threaded build
+
+```sh
+make THREADS=1           # build qemu-build-threads/qemu-system-x86_64
+make THREADS=1 install   # install it instead of the single-threaded one
+make THREADS=1 test
+```
+
+It is built for `wasm32-wasip1-threads` and runs each vCPU on a thread of
+its own (multi-threaded TCG, patch 0008), so a guest with several vCPUs
+runs that many things at once: Chromium's processes, X, the kernel. m-browser
+recognizes it (it imports its memory) and gives it 4 vCPUs (`QEMU_SMP`)
+unless QEMU's arguments set `-smp`; the threads share QEMU's memory, a WASI
+context, the compiled TBs and the display (see m-browser's
+`src/qemu_threads.rs`). Booting is a little slower than with the
+single-threaded build, but the guest stays responsive while it is busy: with
+Chromium starting, clicks are handled within seconds instead of being lost.
+
+Guest memory accesses from different vCPUs are ordered as x86's are only on
+x86-64 hosts.
+
 ## Running
 
 Build m-browser (`cargo build --release`), and put the disk image at
@@ -209,6 +230,7 @@ m-browser passes `QEMU_*` and `WASI_*` variables through to QEMU.
 | `QEMU_JIT_ASYNC=0` | compile hot TBs synchronously, instead of in the background while they stay interpreted |
 | `QEMU_TB_SLICE_MS=<ms>` | how long the vCPU runs between main loop iterations (default 30); each one also costs a busy guest a timer tick |
 | `QEMU_TB_SLICE=<n>` | count slices in TBs instead (formerly fixed at 4000) |
+| `QEMU_TICK_SLACK_MS=<ms>` | multi-threaded build: the guest's timer interrupts come on this grid (default 30; 0 = on time), for the same reason |
 | `QEMU_PROF_EVERY=<s>` | print a time profile every s seconds |
 | `QEMU_STATUS_EVERY=<s>` | print the vCPU state and recent TBs every s seconds |
 | `QEMU_TB_DUMP=<pc>,<dir>` | save the wasm module of the TB at guest pc |
@@ -222,6 +244,9 @@ Read by m-browser itself: `QEMU_NIC` (the `-nic` option, default `user`;
 see [Running](#running)), `QEMU_NET_DEBUG=1` (log the network traffic),
 `QEMU_JIT_STATS=1` (JIT statistics every minute), `QEMU_JIT_THREADS=<n>`
 (background compiler threads, default a quarter of the CPUs, at most 4),
+`QEMU_SMP=<n>` (vCPUs of the multi-threaded build, default 4, at most 8),
+`QEMU_MIGRATE_AFTER=<n>` (TB modules a Store may hold before it is
+replaced, default 100000),
 `QEMU_JIT_DUMP=<dir>[,<n>]` (save every n-th compiled TB module),
 `QEMU_WASM_OPT=speed` (optimize compiled code more), `QEMU_PROFILE=1` (sample
 where QEMU spends its time), and for the headless runner `QEMU_SNAPSHOT`,
@@ -254,7 +279,8 @@ make test       # run the instruction test with both QEMUs (needs gcc and m-brow
 ```
 
 `QEMU_JIT_HOT=0 make test` tests the JIT alone, and
-`QEMU_JIT_HOT=4000000000 make test` the interpreter alone.
+`QEMU_JIT_HOT=4000000000 make test` the interpreter alone; add `THREADS=1`
+for the multi-threaded build.
 
 ## Credits
 

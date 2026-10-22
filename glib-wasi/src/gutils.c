@@ -802,6 +802,7 @@ g_pattern_match_simple(const gchar *pattern, const gchar *string)
 /*  g_once_init_enter / g_once_init_leave (single-threaded)           */
 /* ------------------------------------------------------------------ */
 
+#ifndef WASI_THREADS  /* with threads: in gthread.c */
 gboolean
 g_once_init_enter(volatile gsize *location)
 {
@@ -813,6 +814,7 @@ g_once_init_leave(volatile gsize *location, gsize result)
 {
     *location = result;
 }
+#endif
 
 /* ------------------------------------------------------------------ */
 /*  Crypto stubs (GChecksum / GHmac)                                  */

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Abe Massry <amassry@linode.com>
 Date: Wed, 14 Oct 2026 17:34:27 -0400
-Subject: [PATCH 6/7] net: user-mode networking provided by the WASI host
+Subject: [PATCH 6/8] net: user-mode networking provided by the WASI host
 
 WASI builds have no libslirp.  Implement the "user" netdev by passing
 Ethernet frames to the host, which emulates the user network: the guest

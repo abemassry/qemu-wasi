@@ -64,6 +64,44 @@ typedef gpointer (*GThreadFunc)(gpointer data);
 /*  Synchronisation primitive types (all trivially empty)             */
 /* ------------------------------------------------------------------ */
 
+#ifdef WASI_THREADS
+/*
+ * wasm32-wasip1-threads: real primitives on wasi-libc's pthreads.  A
+ * zero-filled pthread mutex, rwlock or condition variable is a valid
+ * default one, so statically allocated objects need no init call, as in
+ * GLib.
+ */
+#include <pthread.h>
+
+typedef union  _GMutex    { pthread_mutex_t m; } GMutex;
+typedef struct _GRecMutex { pthread_mutex_t m; volatile int ready; } GRecMutex;
+typedef union  _GRWLock   { pthread_rwlock_t l; } GRWLock;
+typedef union  _GCond     { pthread_cond_t c; } GCond;
+
+typedef struct _GOnce {
+    volatile gint     status;
+    volatile gpointer retval;
+} GOnce;
+
+typedef struct _GPrivate {
+    pthread_key_t  key;
+    volatile int   ready;
+    GDestroyNotify notify;
+} GPrivate;
+
+typedef struct _GThread {
+    pthread_t   thread;
+    GThreadFunc func;
+    gpointer    data;
+    gpointer    retval;
+} GThread;
+
+#define G_ONCE_INIT    { 0, NULL }
+#define G_PRIVATE_INIT(notify_fn) { 0, 0, (notify_fn) }
+#define G_MUTEX_INIT   { PTHREAD_MUTEX_INITIALIZER }
+
+#else /* !WASI_THREADS: one thread, everything is trivially empty */
+
 typedef struct _GMutex    { int dummy; } GMutex;
 typedef struct _GRecMutex { int dummy; } GRecMutex;
 typedef struct _GRWLock   { int dummy; } GRWLock;
@@ -91,6 +129,8 @@ typedef struct _GThread {
 #define G_PRIVATE_INIT(notify_fn) { NULL, (notify_fn) }
 #define G_MUTEX_INIT   { 0 }
 
+#endif /* WASI_THREADS */
+
 /* ------------------------------------------------------------------ */
 /*  GOnce status enum                                                 */
 /* ------------------------------------------------------------------ */
@@ -109,9 +149,15 @@ enum {
 #define G_LOCK_DEFINE(name)        GMutex G_LOCK_NAME(name) = G_MUTEX_INIT
 #define G_LOCK_DEFINE_STATIC(name) static GMutex G_LOCK_NAME(name) = G_MUTEX_INIT
 #define G_LOCK_EXTERN(name)        extern GMutex G_LOCK_NAME(name)
+#ifdef WASI_THREADS
+#define G_LOCK(name)               g_mutex_lock(&G_LOCK_NAME(name))
+#define G_UNLOCK(name)             g_mutex_unlock(&G_LOCK_NAME(name))
+#define G_TRYLOCK(name)            g_mutex_trylock(&G_LOCK_NAME(name))
+#else
 #define G_LOCK(name)               (void)0
 #define G_UNLOCK(name)             (void)0
 #define G_TRYLOCK(name)            TRUE
+#endif
 
 /* ------------------------------------------------------------------ */
 /*  Function declarations (implementations in src/gthread.c)          */
@@ -157,10 +203,17 @@ gpointer g_once_impl(GOnce *once, GThreadFunc func, gpointer arg);
  * Real GLib implements this with mutex-based double-checked locking;
  * for single-threaded WASI we just check status directly.
  */
+#ifdef WASI_THREADS
+#define g_once(once, func, arg) \
+    ((__atomic_load_n(&(once)->status, __ATOMIC_ACQUIRE) == G_ONCE_STATUS_READY) ? \
+     (once)->retval : \
+     g_once_impl((once), (func), (arg)))
+#else
 #define g_once(once, func, arg) \
     (((once)->status == G_ONCE_STATUS_READY) ? \
      (once)->retval : \
      g_once_impl((once), (func), (arg)))
+#endif
 
 /* GPrivate (thread-local storage — single value in single-threaded) */
 gpointer g_private_get    (GPrivate *key);

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Abe Massry <amassry@linode.com>
 Date: Wed, 14 Oct 2026 17:34:27 -0400
-Subject: [PATCH 1/7] wasi: build QEMU for wasm32-wasi
+Subject: [PATCH 1/8] wasi: build QEMU for wasm32-wasi
 
 Teach the build system and QEMU's portability layer about a WASI host:
 wasi-sdk's clang targeting wasm32-wasip1, with the module run by a

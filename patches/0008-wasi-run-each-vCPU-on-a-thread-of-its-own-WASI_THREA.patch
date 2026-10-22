@@ -1,0 +1,1159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Abe Massry <amassry@linode.com>
+Date: Wed, 21 Oct 2026 17:08:55 -0400
+Subject: [PATCH 8/8] wasi: run each vCPU on a thread of its own (WASI_THREADS)
+
+The multi-threaded WASI build (qemu-wasi's THREADS=1: wasm32-wasip1-threads,
+with WASI_THREADS defined) runs multi-threaded TCG: one thread per vCPU,
+next to the main loop's.  QEMU's memory is then imported from the host,
+which shares it between the threads, and threads are created through
+wasi-threads' thread-spawn import.  The single-threaded build is unchanged.
+
+vCPU threads (accel/tcg/tcg-accel-ops-mttcg.c, tcg/wasm32.c): the host runs
+each vCPU's TBs in a wasm instance and Store of the vCPU's own, which it
+replaces from time to time to free the TB modules a Store accumulates.  So
+a vCPU thread does not run its loop itself: it calls the host_vcpu_run
+import, and the host calls wasi_vcpu_step(), one iteration of the loop, again
+and again, through wasi_vcpu_enter(), which gives the vCPU's instance this
+thread's stack and thread-local storage.
+
+The TCG backend (tcg/wasm32):
+- Each TB has a JIT handle per vCPU, as each vCPU's instance has a function
+  table of its own; the handles a thread loaded are tracked per thread, and
+  a TB buffer flush makes every thread forget them (a generation count).
+- TB modules import the memory as shared; memory barriers become
+  atomic.fence, which the interpreter runs too.  Its arena of decoded
+  programs is shared under a lock, and its decoder state is per thread.
+- TCG_TARGET_DEFAULT_MO: x86 guests need no barriers for ordinary accesses,
+  as TB code keeps them in program order and x86-64 hosts keep TSO.
+- A TB whose module the host still has is reloaded by every vCPU, not only
+  by the one that brings its shared run count to QEMU_JIT_WARM.
+
+Undone for WASI_THREADS: the single-threaded shortcuts (inline run_on_cpu,
+vCPU stop and creation without waiting, time slices, RCU callbacks run by
+the main loop), so that QEMU's own multi-threaded code runs.
+
+The main loop sleeps with the BQL released.  It sleeps in the host, out of
+reach of event notifiers (and glib-wasi never sets notify_me), so
+aio_notify() from another thread wakes it through the host_main_wake
+import.  Event notifiers are atomic.
+
+The guest's timer tick: the local APIC timer fires on a grid of
+QEMU_TICK_SLACK_MS (default 30 ms), which the single-threaded build gets
+from its time slices.  At 1000 ticks a second, ticks took half of a busy
+guest's time.
+
+meson.build: CONFIG_ATOMIC64 for wasm32 with atomics.  The link test fails
+on wasm-ld for an unrelated reason (meson's --start-group), and without it
+every 8-byte guest access missing the TLB took the stop-the-world
+exclusive path with more than one vCPU.
+
+Threads get 16 MiB stacks, as a vCPU thread's stack also holds its vCPU
+instance's frames.
+---
+ accel/tcg/cpu-exec.c                |   3 +-
+ accel/tcg/tcg-accel-ops-mttcg.c     |  84 +++++++++++++
+ accel/tcg/tcg-all.c                 |  10 +-
+ cpu-common.c                        |   2 +-
+ hw/intc/apic.c                      |  25 ++++
+ include/qemu/main-loop.h            |   8 ++
+ meson.build                         |   7 ++
+ system/cpus.c                       |   4 +-
+ system/main.c                       |  16 +++
+ system/runstate.c                   |  12 ++
+ tcg/wasm32.c                        | 189 +++++++++++++++++++---------
+ tcg/wasm32.h                        |  16 +++
+ tcg/wasm32/tcg-target.c.inc         |   6 +
+ tcg/wasm32/tcg-target.h             |  10 ++
+ tcg/wasm32/tcg-wasm32-helpers.c.inc |  28 +++--
+ tcg/wasm32/wasi-interp.c.inc        |  45 ++++++-
+ tcg/wasm32/wasi_platform.h          |   1 +
+ util/async.c                        |   7 ++
+ util/event_notifier-posix.c         |   7 +-
+ util/main-loop.c                    |  42 ++++++-
+ util/qemu-thread-posix.c            |   8 ++
+ 21 files changed, 451 insertions(+), 79 deletions(-)
+
+diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
+index 849c409..0def5d2 100644
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -1111,9 +1111,10 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
+         return true;
+     }
+ 
+-#ifdef WASI_PLATFORM
++#if defined(WASI_PLATFORM) && !defined(WASI_THREADS)
+     /*
+      * Periodically yield back to the main loop so it can run timers.
++     * (With WASI_THREADS, the main loop has a thread of its own.)
+      *
+      * On WASI there is no separate vCPU thread and no TCG "kick" timer
+      * thread, so the main loop (and therefore qemu_clock_run_all_timers,
+diff --git a/accel/tcg/tcg-accel-ops-mttcg.c b/accel/tcg/tcg-accel-ops-mttcg.c
+index 49814ec..4b276f8 100644
+--- a/accel/tcg/tcg-accel-ops-mttcg.c
++++ b/accel/tcg/tcg-accel-ops-mttcg.c
+@@ -62,6 +62,84 @@ static void mttcg_force_rcu(Notifier *notify, void *data)
+  * current CPUState for a given thread.
+  */
+ 
++#ifdef WASI_THREADS
++/*
++ * vCPU threads on WASI.
++ *
++ * The host runs the TBs of each vCPU thread in a wasmtime Store of the
++ * thread's own, and replaces that Store from time to time: a Store keeps
++ * every TB module instantiated in it until it is dropped (see m-browser's
++ * qemu_threads.rs).  It can only be dropped while the thread has no frames
++ * in it, so the thread does not run the vCPU loop below itself.  It asks the
++ * host to run it (host_vcpu_run), and the host calls wasi_vcpu_step(), one
++ * iteration of the loop, again and again, each time through
++ * wasi_vcpu_enter() (tcg/wasm32.c) of the vCPU's current Store, until the
++ * vCPU is unplugged.  That Store's wasm instance shares this thread's stack
++ * (below this frame) and thread-local storage.
++ */
++
++/* Host import: run the vCPU of this thread; returns when it is unplugged. */
++extern void host_vcpu_run(int32_t cpu_index, uint32_t stack_top,
++                          uint32_t tls_base);
++
++/* wasi_vcpu_step() flags, from the host */
++#define WASI_VCPU_JIT_RESET 1   /* the vCPU's Store is new: forget all TBs */
++
++extern void wasi_tb_cache_forget_all(void);
++
++int wasi_vcpu_step(int flags);
++int wasi_vcpu_step(int flags)
++{
++    CPUState *cpu = current_cpu;
++    int done;
++
++    if (flags & WASI_VCPU_JIT_RESET) {
++        wasi_tb_cache_forget_all();
++    }
++
++    bql_lock();
++    if (cpu_can_run(cpu)) {
++        int r;
++
++        bql_unlock();
++        r = tcg_cpu_exec(cpu);
++        bql_lock();
++        switch (r) {
++        case EXCP_DEBUG:
++            cpu_handle_guest_debug(cpu);
++            break;
++        case EXCP_HALTED:
++            break;
++        case EXCP_ATOMIC:
++            bql_unlock();
++            cpu_exec_step_atomic(cpu);
++            bql_lock();
++            break;
++        default:
++            break;
++        }
++    }
++    qatomic_set_mb(&cpu->exit_request, 0);
++    qemu_wait_io_event(cpu);
++    done = cpu->unplug && !cpu_can_run(cpu);
++    bql_unlock();
++    return done;
++}
++
++static void __attribute__((noinline)) wasi_vcpu_thread_run(CPUState *cpu)
++{
++    /*
++     * The vCPU's instance runs on this thread's stack below this frame,
++     * which is the last one above it: give it the stack from just below.
++     */
++    volatile uint8_t here;
++    uint32_t stack_top = ((uintptr_t)&here - 64) & ~(uintptr_t)15;
++
++    host_vcpu_run(cpu->cpu_index, stack_top,
++                  (uint32_t)(uintptr_t)__builtin_wasm_tls_base());
++}
++#endif /* WASI_THREADS */
++
+ static void *mttcg_cpu_thread_fn(void *arg)
+ {
+     MttcgForceRcuNotifier force_rcu;
+@@ -88,6 +166,11 @@ static void *mttcg_cpu_thread_fn(void *arg)
+     /* process any pending work */
+     cpu->exit_request = 1;
+ 
++#ifdef WASI_THREADS
++    bql_unlock();
++    wasi_vcpu_thread_run(cpu);
++    bql_lock();
++#else
+     do {
+         if (cpu_can_run(cpu)) {
+             int r;
+@@ -117,6 +200,7 @@ static void *mttcg_cpu_thread_fn(void *arg)
+         qatomic_set_mb(&cpu->exit_request, 0);
+         qemu_wait_io_event(cpu);
+     } while (!cpu->unplug || cpu_can_run(cpu));
++#endif
+ 
+     tcg_cpu_destroy(cpu);
+     bql_unlock();
+diff --git a/accel/tcg/tcg-all.c b/accel/tcg/tcg-all.c
+index 50098cb..2ad2227 100644
+--- a/accel/tcg/tcg-all.c
++++ b/accel/tcg/tcg-all.c
+@@ -70,12 +70,13 @@ DECLARE_INSTANCE_CHECKER(TCGState, TCG_STATE,
+ 
+ static bool default_mttcg_enabled(void)
+ {
+-#ifdef WASI_PLATFORM
++#if defined(WASI_PLATFORM) && !defined(WASI_THREADS)
+     /*
+      * WASI has no threads: the vCPU is driven inline from the main loop by
+      * wasi_rr_cpu_step(), which is round-robin (single-threaded) TCG.  MTTCG
+      * would "create" a vCPU thread through a pthread stub that never runs,
+      * leaving cpu->thread with a fake id so qemu_cpu_is_self() is false.
++     * (The WASI_THREADS build has real threads, and always uses MTTCG.)
+      */
+     return false;
+ #endif
+@@ -148,7 +149,7 @@ static void tcg_set_thread(Object *obj, const char *value, Error **errp)
+     TCGState *s = TCG_STATE(obj);
+ 
+     if (strcmp(value, "multi") == 0) {
+-#ifdef WASI_PLATFORM
++#if defined(WASI_PLATFORM) && !defined(WASI_THREADS)
+         error_setg(errp, "No MTTCG on WASI: there are no threads");
+         return;
+ #endif
+@@ -164,6 +165,11 @@ static void tcg_set_thread(Object *obj, const char *value, Error **errp)
+             s->mttcg_enabled = true;
+         }
+     } else if (strcmp(value, "single") == 0) {
++#ifdef WASI_THREADS
++        error_setg(errp, "This build runs each vCPU on a thread of its own "
++                   "(thread=multi)");
++        return;
++#endif
+         s->mttcg_enabled = false;
+     } else {
+         error_setg(errp, "Invalid 'thread' setting %s", value);
+diff --git a/cpu-common.c b/cpu-common.c
+index d47f40e..fda8e95 100644
+--- a/cpu-common.c
++++ b/cpu-common.c
+@@ -146,7 +146,7 @@ void do_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data,
+ {
+     struct qemu_work_item wi;
+ 
+-#ifdef WASI_PLATFORM
++#if defined(WASI_PLATFORM) && !defined(WASI_THREADS)
+     /* WASI is single-threaded — always execute inline */
+     func(cpu, data);
+     return;
+diff --git a/hw/intc/apic.c b/hw/intc/apic.c
+index 4186c57..274ba73 100644
+--- a/hw/intc/apic.c
++++ b/hw/intc/apic.c
+@@ -771,10 +771,35 @@ int apic_accept_pic_intr(DeviceState *dev)
+     return 0;
+ }
+ 
++#ifdef WASI_THREADS
++/*
++ * The guest's tick is this timer, and under emulation each tick costs a
++ * busy guest thousands of instructions: about half of all its time at 1000
++ * ticks a second.  Fire the timer on a grid of QEMU_TICK_SLACK_MS (default
++ * 30 ms) instead, which the guest sees as late ticks.  (The single-threaded
++ * WASI build gets the same effect from running the vCPU in time slices.)
++ */
++static int64_t apic_timer_slack(int64_t t)
++{
++    static int64_t slack = -1;
++
++    if (slack < 0) {
++        const char *env = getenv("QEMU_TICK_SLACK_MS");
++
++        slack = (env ? atoll(env) : 30) * SCALE_MS;
++    }
++    return slack > 0 ? QEMU_ALIGN_UP(t, slack) : t;
++}
++#endif
++
+ static void apic_timer_update(APICCommonState *s, int64_t current_time)
+ {
+     if (apic_next_timer(s, current_time)) {
++#ifdef WASI_THREADS
++        timer_mod(s->timer, apic_timer_slack(s->next_time));
++#else
+         timer_mod(s->timer, s->next_time);
++#endif
+     } else {
+         timer_del(s->timer);
+     }
+diff --git a/include/qemu/main-loop.h b/include/qemu/main-loop.h
+index d9f9a5e..8ff0597 100644
+--- a/include/qemu/main-loop.h
++++ b/include/qemu/main-loop.h
+@@ -99,6 +99,14 @@ void main_loop_wait(int nonblocking);
+  * that returns early instead.
+  */
+ extern void (*wasi_idle_wait)(int64_t ns);
++
++#ifdef WASI_THREADS
++/*
++ * Wake the main loop from another thread: it sleeps in the host (see
++ * main_loop_wait()), where no event notifier reaches it.
++ */
++void wasi_main_wake(void);
++#endif
+ #endif
+ 
+ /**
+diff --git a/meson.build b/meson.build
+index 6d5c6bb..d4b9e38 100644
+--- a/meson.build
++++ b/meson.build
+@@ -2796,6 +2796,13 @@ config_host_data.set('CONFIG_ATOMIC64', cc.links('''
+     __atomic_fetch_add(&x, y, __ATOMIC_RELAXED);
+     return 0;
+   }'''))
++# wasm32 with the atomics feature (the WASI threads build) has them, but the
++# link test fails there for an unrelated reason: wasm-ld rejects the
++# --start-group meson adds.  Without them, multi-threaded TCG takes the slow,
++# stop-the-world path for every 8-byte guest access that misses the TLB.
++if not config_host_data.get('CONFIG_ATOMIC64') and cc.get_define('__wasm_atomics__') == '1'
++  config_host_data.set('CONFIG_ATOMIC64', true)
++endif
+ 
+ has_int128_type = cc.compiles('''
+   __int128_t a;
+diff --git a/system/cpus.c b/system/cpus.c
+index 88bacb2..a1909e5 100644
+--- a/system/cpus.c
++++ b/system/cpus.c
+@@ -445,7 +445,7 @@ void qemu_wait_io_event_common(CPUState *cpu)
+ {
+     qatomic_set_mb(&cpu->thread_kicked, false);
+     if (cpu->stop) {
+-#ifdef WASI_PLATFORM
++#if defined(WASI_PLATFORM) && !defined(WASI_THREADS)
+         /*
+          * On WASI we drive the vCPU inline from the main loop — there is no
+          * per-cpu thread. qemu_cpu_stop()'s g_assert(qemu_cpu_is_self(cpu))
+@@ -702,7 +702,7 @@ void qemu_init_vcpu(CPUState *cpu)
+     cpus_accel->create_vcpu_thread(cpu);
+     WASI_LOG_V("WASI_DBG: qemu_init_vcpu: after create_vcpu_thread, cpu->created=%d\n", cpu->created);
+ 
+-#ifdef WASI_PLATFORM
++#if defined(WASI_PLATFORM) && !defined(WASI_THREADS)
+     /* On WASI, create_vcpu_thread runs inline and sets cpu->created=true.
+      * No need to wait. */
+ #else
+diff --git a/system/main.c b/system/main.c
+index 7536fc4..8488f9c 100644
+--- a/system/main.c
++++ b/system/main.c
+@@ -45,6 +45,7 @@ int (*qemu_main)(void) = qemu_default_main;
+ #ifdef WASI_PLATFORM
+ #include <wasi/api.h>
+ #include "sysemu/runstate.h"
++#include "hw/core/cpu.h"
+ 
+ /*
+  * WASI reactor entry points.
+@@ -91,6 +92,21 @@ int wasi_qemu_step(void)
+         return -1;
+     }
+     qemu_cleanup(status);
++#ifdef WASI_THREADS
++    {
++        /*
++         * The vCPU threads would wait forever, stopped: unplug them, so
++         * that they end and the host can let go of their Stores.
++         */
++        CPUState *cpu;
++
++        CPU_FOREACH(cpu) {
++            cpu->stop = true;
++            cpu->unplug = true;
++            qemu_cpu_kick(cpu);
++        }
++    }
++#endif
+     return status < 0 ? 1 : status;
+ }
+ 
+diff --git a/system/runstate.c b/system/runstate.c
+index c87c977..6d96064 100644
+--- a/system/runstate.c
++++ b/system/runstate.c
+@@ -922,6 +922,18 @@ bool qemu_main_loop_step(int *status)
+     if (main_loop_should_exit(status)) {
+         return true;
+     }
++#ifdef WASI_THREADS
++    /*
++     * The vCPUs run on threads of their own, and the call_rcu thread runs
++     * the RCU callbacks: this is a plain main loop iteration.
++     */
++    wasi_status_dump();
++    main_loop_wait(false);
++#ifndef CONFIG_SLIRP
++    wasi_net_poll();
++#endif
++    return false;
++#endif
+     extern void wasi_prof_add_loop(int64_t loop_ns, int64_t cpu_ns);
+     extern void wasi_prof_report_maybe(void);
+     extern int64_t wasi_prof_clock(void);
+diff --git a/tcg/wasm32.c b/tcg/wasm32.c
+index eaac087..3dd69e2 100644
+--- a/tcg/wasm32.c
++++ b/tcg/wasm32.c
+@@ -22,6 +22,34 @@
+ /* Thread-local TB pointer used by the TCI/wasm32 execution path */
+ __thread uintptr_t tci_tb_ptr;
+ 
++#ifdef WASI_THREADS
++/*
++ * wasi_vcpu_enter(stack_top, tls_base, flags): how the host runs one step of
++ * a vCPU thread, wasi_vcpu_step() in accel/tcg/tcg-accel-ops-mttcg.c, in the
++ * vCPU's own wasm instance.  That instance runs on the vCPU thread's stack
++ * and with its thread-local storage, whose addresses it is given here: a
++ * fresh instance starts out with the main thread's.  wasm-ld only lets
++ * assembly set these globals, as wasi-libc's wasi_thread_start does too.
++ */
++__asm__(
++    ".globaltype __stack_pointer, i32\n"
++    ".globaltype __tls_base, i32\n"
++    ".functype wasi_vcpu_step (i32) -> (i32)\n"
++    ".section .text.wasi_vcpu_enter,\"\",@\n"
++    ".globl wasi_vcpu_enter\n"
++    ".type wasi_vcpu_enter,@function\n"
++    "wasi_vcpu_enter:\n"
++    ".functype wasi_vcpu_enter (i32, i32, i32) -> (i32)\n"
++    "  local.get 0\n"
++    "  global.set __stack_pointer\n"
++    "  local.get 1\n"
++    "  global.set __tls_base\n"
++    "  local.get 2\n"
++    "  call wasi_vcpu_step\n"
++    "  end_function\n"
++    ".export_name wasi_vcpu_enter, wasi_vcpu_enter\n");
++#endif
++
+ /* Disassemble TCI bytecode (no-op for wasm target). */
+ int print_insn_tci(bfd_vma addr, disassemble_info *info)
+ {
+@@ -136,16 +164,20 @@ static void prepare_wasm(void *tb_ptr, int cur_core_num, int all_cores_num)
+ /*
+  * Compiled TB modules.
+  *
+- * Each TB carries a uint32 slot (see wasm_finalize_module) holding the
+- * host JIT handle of its compiled module, 0 if not compiled yet, so lookup
+- * is O(1).  Live handles are also tracked in a FIFO ring so that they can
++ * Each TB carries a uint32 slot per vCPU (see WASI_SLOTS) holding the host
++ * JIT handle of its compiled module, 0 if not compiled yet, so lookup is
++ * O(1).  A handle is the index of the module's entry function in the
++ * function table of the wasm instance the vCPU runs in: with WASI_THREADS
++ * each vCPU thread has an instance, and so a table, of its own.  The
++ * handles a thread loaded are also tracked in a FIFO ring so that they can
+  * all be forgotten at once.
+  *
+  * Note that dropping a handle does not free anything on the host: wasmtime
+  * keeps every instance alive until its Store is dropped.  The host frees
+- * them by moving QEMU into a fresh Store between main loop iterations and
+- * then calling wasi_qemu_jit_reset().  The ring is therefore sized so that
+- * eviction, which only causes recompilation, practically never happens.
++ * them by moving the thread into a fresh Store between iterations of its
++ * loop, then tells it to forget its handles: wasi_qemu_jit_reset(), or
++ * WASI_VCPU_JIT_RESET with WASI_THREADS.  The ring is therefore sized so
++ * that eviction, which only causes reloading, practically never happens.
+  */
+ #define TB_CACHE_MAX 65536
+ 
+@@ -154,13 +186,44 @@ struct tb_cache_entry {
+     uint32_t jit_handle;   /* handle from wasi_jit_compile */
+ };
+ 
+-static struct tb_cache_entry tb_cache[TB_CACHE_MAX];
+-static unsigned tb_cache_head;   /* index of the oldest entry */
+-static unsigned tb_cache_count;
++struct tb_cache {
++    struct tb_cache_entry e[TB_CACHE_MAX];
++    unsigned head;          /* index of the oldest entry */
++    unsigned count;
++    unsigned gen;           /* tb_flush_gen when last emptied */
++};
++
++static __thread struct tb_cache *tbc;
++
++/*
++ * Incremented by each TB buffer flush, which takes every TB and so every
++ * handle slot with it: a thread then empties its ring before using it again
++ * (with WASI_THREADS, a flush runs while all other vCPUs are stopped).
++ */
++static unsigned tb_flush_gen;
++
++/* This thread's handle slot in each TB: its vCPU's. */
++static __thread unsigned jit_slot;
++
++static struct tb_cache *this_tb_cache(void)
++{
++    struct tb_cache *c = tbc;
++    unsigned gen = qatomic_read(&tb_flush_gen);
++
++    if (unlikely(!c)) {
++        c = tbc = g_new0(struct tb_cache, 1);
++        c->gen = gen;
++    } else if (unlikely(c->gen != gen)) {
++        c->head = c->count = 0;
++        c->gen = gen;
++    }
++    return c;
++}
+ 
+ /*
+- * Per-TB execution state (see wasm_finalize_module): [0] JIT handle,
+- * [1] interpreter execution count, [2] decoded interpreter program.
++ * Per-TB execution state (see wasm_finalize_module): the vCPUs' JIT handles,
++ * then [WASI_SLOT_COUNT] interpreter execution count and [WASI_SLOT_PROG]
++ * decoded interpreter program.
+  */
+ static inline uint32_t *tb_handle_slot(void *tb_ptr)
+ {
+@@ -395,24 +458,24 @@ void wasi_tb_exec_report(FILE *f)
+             interp_warm, interp_stats.jit_failed, interp_stats.execs);
+ }
+ 
+-static void evict_oldest_tbs(unsigned count)
++static void evict_oldest_tbs(struct tb_cache *c, unsigned count)
+ {
+-    while (count-- && tb_cache_count) {
+-        struct tb_cache_entry *e = &tb_cache[tb_cache_head];
++    while (count-- && c->count) {
++        struct tb_cache_entry *e = &c->e[c->head];
+ 
+         if (*e->slot == e->jit_handle) {
+             *e->slot = 0;
+         }
+-        wasi_jit_drop(e->jit_handle);
+-        tb_cache_head = (tb_cache_head + 1) % TB_CACHE_MAX;
+-        tb_cache_count--;
++        c->head = (c->head + 1) % TB_CACHE_MAX;
++        c->count--;
+     }
+ }
+ 
+ /*
+- * Drop every compiled module.  Called when QEMU flushes the TB code buffer
++ * Forget every compiled module.  Called when QEMU flushes the TB code buffer
+  * (tcg_region_reset_all): the buffer is about to be reused for new TBs, so
+- * all slots in it are going away and the modules can never run again.
++ * all slots in it are going away and the modules can never run again.  (The
++ * host keeps them: TBs translated from the same code again reuse them.)
+  */
+ void wasi_tb_cache_flush(void)
+ {
+@@ -426,46 +489,36 @@ void wasi_tb_cache_flush(void)
+     flushes++;
+     if (flushes <= 10 || flushes % 10 == 0) {
+         fprintf(stderr, "[qemu-wasi] TB buffer flush #%llu (%u compiled TBs dropped)\n",
+-                (unsigned long long)flushes, tb_cache_count);
++                (unsigned long long)flushes, this_tb_cache()->count);
+         wasi_tb_exec_report(stderr);
+     }
+     interp_arena_retire();
+-
+-    while (tb_cache_count) {
+-        wasi_jit_drop(tb_cache[tb_cache_head].jit_handle);
+-        tb_cache_head = (tb_cache_head + 1) % TB_CACHE_MAX;
+-        tb_cache_count--;
+-    }
+-    tb_cache_head = 0;
++    qatomic_inc(&tb_flush_gen);
+ }
+ 
+ /*
+- * The host discarded every compiled module (it moved QEMU into a new
+- * wasmtime Store).  Clear the handle slots of all TBs that had one, so they
+- * are recompiled on their next execution; there is nothing to drop.
++ * The host discarded every compiled module of this thread (it moved the
++ * thread into a new wasmtime Store).  Clear the handle slots of all TBs that
++ * had one, so they are reloaded on their next execution.
+  */
+ void wasi_tb_cache_forget_all(void)
+ {
+-    while (tb_cache_count) {
+-        struct tb_cache_entry *e = &tb_cache[tb_cache_head];
++    struct tb_cache *c = this_tb_cache();
+ 
+-        if (*e->slot == e->jit_handle) {
+-            *e->slot = 0;
+-        }
+-        tb_cache_head = (tb_cache_head + 1) % TB_CACHE_MAX;
+-        tb_cache_count--;
+-    }
+-    tb_cache_head = 0;
++    evict_oldest_tbs(c, c->count);
++    c->head = 0;
+ }
+ 
+ static void remember_compiled_tb(uint32_t *slot, uint32_t handle)
+ {
+-    if (tb_cache_count == TB_CACHE_MAX) {
+-        evict_oldest_tbs(TB_CACHE_MAX / 4);
++    struct tb_cache *c = this_tb_cache();
++
++    if (c->count == TB_CACHE_MAX) {
++        evict_oldest_tbs(c, TB_CACHE_MAX / 4);
+     }
+-    tb_cache[(tb_cache_head + tb_cache_count) % TB_CACHE_MAX] =
++    c->e[(c->head + c->count) % TB_CACHE_MAX] =
+         (struct tb_cache_entry){ .slot = slot, .jit_handle = handle };
+-    tb_cache_count++;
++    c->count++;
+     *slot = handle;
+ }
+ 
+@@ -570,7 +623,7 @@ static uint32_t compile_and_cache_tb(void *tb_ptr, int mode)
+         return handle;
+     }
+ 
+-    remember_compiled_tb(tb_handle_slot(tb_ptr), handle);
++    remember_compiled_tb(tb_handle_slot(tb_ptr) + jit_slot, handle);
+     return handle;
+ }
+ 
+@@ -648,13 +701,21 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env, const void *v_tb_
+ #endif /* EMSCRIPTEN */
+ 
+ #ifdef WASI_PLATFORM
+-    static bool initialized = false;
++    static __thread bool initialized = false;
+     static uint64_t exec_count = 0;
+ 
+     if (!initialized) {
+         ctx.stack = (uint64_t *)malloc(256 * sizeof(uint64_t));
+         ctx.stack128 = (uint64_t *)malloc(256 * sizeof(uint64_t));
+         initialized = true;
++#ifdef WASI_THREADS
++        jit_slot = current_cpu ? current_cpu->cpu_index : 0;
++        if (jit_slot >= WASI_JIT_SLOTS) {
++            fprintf(stderr, "qemu-wasi: at most %d vCPUs are supported\n",
++                    WASI_JIT_SLOTS);
++            abort();
++        }
++#endif
+     }
+ 
+     ctx.env = env;
+@@ -697,24 +758,36 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env, const void *v_tb_
+ 
+     while (1) {
+         uint32_t *slot = tb_handle_slot(ctx.tb_ptr);
+-        uint32_t handle = slot[0];
++        uint32_t handle = slot[jit_slot];
+         uint32_t res;
+ 
+         wasi_tbs_executed++;
+ 
+         if (handle == 0) {
+-            uintptr_t prog = slot[2];
++            uintptr_t prog = slot[WASI_SLOT_PROG];
+ 
+             if (prog == 0) {
+                 int64_t t = prof_now();
+ 
+                 prog = interp_decode(ctx.tb_ptr);
+-                slot[2] = (uint32_t)prog;
++                slot[WASI_SLOT_PROG] = (uint32_t)prog;
+                 wasi_prof.decode_ns += prof_now() - t;
+                 wasi_prof.decode_n++;
+             }
+             if (prog != INTERP_UNSUPPORTED && !(prog & INTERP_NO_JIT) &&
+-                slot[1] == interp_warm && interp_warm < interp_hot) {
++                interp_warm < interp_hot &&
++#ifdef WASI_THREADS
++                /*
++                 * The run count is shared by the vCPUs, the handles are not:
++                 * every vCPU must get to ask, not only the one that makes
++                 * the count reach interp_warm.
++                 */
++                slot[WASI_SLOT_COUNT] >= interp_warm &&
++                (slot[WASI_SLOT_COUNT] - interp_warm) % JIT_ASYNC_RETRY == 0 &&
++                slot[WASI_SLOT_COUNT] < interp_hot) {
++#else
++                slot[WASI_SLOT_COUNT] == interp_warm) {
++#endif
+                 /*
+                  * Translating the same guest code again (after a TB buffer
+                  * flush, say) gives the same module.  If the host still has
+@@ -730,8 +803,8 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env, const void *v_tb_
+                     interp_stats.reloaded++;
+                 }
+             } else if (jit_async && prog != INTERP_UNSUPPORTED &&
+-                       !(prog & INTERP_NO_JIT) && slot[1] >= interp_hot &&
+-                       (slot[1] - interp_hot) % JIT_ASYNC_RETRY == 0) {
++                       !(prog & INTERP_NO_JIT) && slot[WASI_SLOT_COUNT] >= interp_hot &&
++                       (slot[WASI_SLOT_COUNT] - interp_hot) % JIT_ASYNC_RETRY == 0) {
+                 /*
+                  * Hot: the host compiles the module on another thread, and
+                  * the TB stays interpreted until it is ready.
+@@ -744,7 +817,7 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env, const void *v_tb_
+                     /* The JIT rejected it: keep interpreting this TB. */
+                     interp_stats.jit_failed++;
+                     prog |= INTERP_NO_JIT;
+-                    slot[2] = (uint32_t)prog;
++                    slot[WASI_SLOT_PROG] = (uint32_t)prog;
+                     handle = 0;
+                 } else if (handle) {
+                     wasi_prof.jit_n++;
+@@ -752,8 +825,8 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env, const void *v_tb_
+                 }
+             }
+             if (handle == 0 && prog != INTERP_UNSUPPORTED &&
+-                ((prog & INTERP_NO_JIT) || slot[1] < interp_hot || jit_async)) {
+-                interp_count_run(prog, slot[1]++);
++                ((prog & INTERP_NO_JIT) || slot[WASI_SLOT_COUNT] < interp_hot || jit_async)) {
++                interp_count_run(prog, slot[WASI_SLOT_COUNT]++);
+                 interp_stats.execs++;
+                 wasi_prof.interp_n++;
+                 if ((wasi_prof.interp_n & 255) == 0) {
+@@ -769,7 +842,7 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env, const void *v_tb_
+             }
+         }
+         if (handle == 0) {
+-            uintptr_t prog = slot[2];
++            uintptr_t prog = slot[WASI_SLOT_PROG];
+ 
+             if (prog != INTERP_UNSUPPORTED) {
+                 interp_stats.promoted++;
+@@ -793,8 +866,8 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env, const void *v_tb_
+                 }
+                 /* The JIT rejected it: keep interpreting this TB. */
+                 interp_stats.jit_failed++;
+-                slot[2] = (uint32_t)(prog | INTERP_NO_JIT);
+-                slot[1]++;
++                slot[WASI_SLOT_PROG] = (uint32_t)(prog | INTERP_NO_JIT);
++                slot[WASI_SLOT_COUNT]++;
+                 interp_stats.execs++;
+                 res = interp_exec(INTERP_PROG(prog), &ctx);
+                 goto next_tb;
+@@ -825,6 +898,7 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env, const void *v_tb_
+         if ((uint32_t)(uintptr_t)ctx.tb_ptr == 0) {
+             return res;
+         }
++#ifndef WASI_THREADS    /* (vCPU threads do not yield to the main loop) */
+         if (unlikely(wasi_tbs_executed >= wasi_tb_yield_at) && current_cpu) {
+             /*
+              * Time to let the main loop run timers.  Do what a timer kick
+@@ -834,6 +908,7 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env, const void *v_tb_
+              */
+             qatomic_set(&current_cpu->neg.icount_decr.u16.high, -1);
+         }
++#endif
+ 
+         /*
+          * Continue with the TB that goto_ptr or goto_tb selected.  Each call
+diff --git a/tcg/wasm32.h b/tcg/wasm32.h
+index 3278f25..831e31a 100644
+--- a/tcg/wasm32.h
++++ b/tcg/wasm32.h
+@@ -29,6 +29,22 @@ struct wasmContext {
+ #define STACK128_OFF 24
+ #define UNWINDING_OFF 28
+ 
++/*
++ * Per-TB execution state, found through each TB's export_vec (see
++ * wasm_finalize_module()): first the handle of the TB's compiled module for
++ * each vCPU, as each vCPU thread runs TBs in a wasm instance, with a
++ * function table, of its own (WASI_THREADS); then the number of times the
++ * interpreter ran the TB; then its decoded interpreter program.
++ */
++#ifdef WASI_THREADS
++#define WASI_JIT_SLOTS      8       /* vCPUs at most */
++#else
++#define WASI_JIT_SLOTS      1
++#endif
++#define WASI_SLOT_COUNT     WASI_JIT_SLOTS
++#define WASI_SLOT_PROG      (WASI_JIT_SLOTS + 1)
++#define WASI_SLOTS          (WASI_JIT_SLOTS + 2)
++
+ void set_done_flag();
+ 
+ void set_unwinding_flag();
+diff --git a/tcg/wasm32/tcg-target.c.inc b/tcg/wasm32/tcg-target.c.inc
+index 198897d..d7e8653 100644
+--- a/tcg/wasm32/tcg-target.c.inc
++++ b/tcg/wasm32/tcg-target.c.inc
+@@ -2924,6 +2924,12 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc,
+         tcg_out_qemu_st(s, args, true);
+         break;
+     case INDEX_op_mb:
++#ifdef WASI_THREADS
++        /* Only emitted when the guest needs more order than the host gives. */
++        tcg_out8(s, 0xfe);  /* atomic.fence */
++        tcg_out8(s, 0x03);
++        tcg_out8(s, 0x00);
++#endif
+         break;
+     case INDEX_op_deposit_i32:
+     case INDEX_op_deposit_i64:
+diff --git a/tcg/wasm32/tcg-target.h b/tcg/wasm32/tcg-target.h
+index da79b6f..7e20862 100644
+--- a/tcg/wasm32/tcg-target.h
++++ b/tcg/wasm32/tcg-target.h
+@@ -155,7 +155,17 @@ typedef enum {
+ 
+ #define HAVE_TCG_QEMU_TB_EXEC
+ 
++#ifdef WASI_THREADS
++/*
++ * Memory accesses in TBs are plain wasm loads and stores, which Cranelift
++ * (the host compiles TB modules without optimization) emits in program
++ * order; on an x86-64 host they are then ordered like x86's own.  So x86
++ * guests need barriers only where they ask for them (mfence, ...).
++ */
++#define TCG_TARGET_DEFAULT_MO  (TCG_MO_ALL & ~TCG_MO_ST_LD)
++#else
+ #define TCG_TARGET_DEFAULT_MO  (0)
++#endif
+ 
+ #define TCG_TARGET_HAS_MEMORY_BSWAP     0
+ 
+diff --git a/tcg/wasm32/tcg-wasm32-helpers.c.inc b/tcg/wasm32/tcg-wasm32-helpers.c.inc
+index ce40021..f9f8ac9 100644
+--- a/tcg/wasm32/tcg-wasm32-helpers.c.inc
++++ b/tcg/wasm32/tcg-wasm32-helpers.c.inc
+@@ -14,6 +14,7 @@
+ #define TCG_WASM32_HELPERS_INC
+ 
+ #include <string.h>
++#include "../wasm32.h"          /* WASI_SLOTS */
+ 
+ /*
+  * Maximum limits for wasm module construction.
+@@ -476,8 +477,15 @@ void wasm_finalize_module(TCGContext *s)
+         isec[ip++] = 'b'; isec[ip++] = 'u'; isec[ip++] = 'f';
+         isec[ip++] = 'f'; isec[ip++] = 'e'; isec[ip++] = 'r';
+         isec[ip++] = 0x02; /* memory import */
++#ifdef WASI_THREADS
++        /* QEMU's memory is shared between its threads: so is the import. */
++        isec[ip++] = 0x03; /* limits: shared, with a maximum */
++        ip += write_leb128_u32(isec + ip, 1); /* min pages = 1 */
++        ip += write_leb128_u32(isec + ip, 65536); /* max: 4 GiB, as QEMU's */
++#else
+         isec[ip++] = 0x00; /* limits: no max */
+         ip += write_leb128_u32(isec + ip, 1); /* min pages = 1 */
++#endif
+ 
+         /* Table import: "env"."table", funcref, min 1, no max */
+         ip += write_leb128_u32(isec + ip, 3); /* "env" len */
+@@ -699,21 +707,25 @@ void wasm_finalize_module(TCGContext *s)
+ 
+     /*
+      * export_vec: per-TB execution state, found by tcg_qemu_tb_exec() in
+-     * O(1) at tb_ptr + export_vec_offset + 4:
+-     *   [0] compiled-module handle (0 = not compiled yet)
+-     *   [1] number of times the interpreter has run this TB
+-     *   [2] decoded interpreter program (0 = not decoded yet)
++     * O(1) at tb_ptr + export_vec_offset + 4 (see WASI_SLOTS):
++     *   [vCPU]            compiled-module handle (0 = not compiled yet)
++     *   [WASI_SLOT_COUNT] number of times the interpreter has run this TB
++     *   [WASI_SLOT_PROG]  decoded interpreter program (0 = not decoded yet)
+      * Because the slots live with the TB, a tb_flush that reuses the code
+      * buffer also starts every new TB from zero rather than stale state.
+      */
+-    uint32_t export_vec_size = 12;
++    uint32_t export_vec_size = 4 * WASI_SLOTS;
++    /* Aligned, so that other threads never see a slot half written. */
++    while ((uintptr_t)out & 3) {
++        *out++ = 0;
++    }
+     memcpy(out, &export_vec_size, 4);
+     out += 4;
+-    memset(out, 0, 12);
+-    out += 12;
++    memset(out, 0, 4 * WASI_SLOTS);
++    out += 4 * WASI_SLOTS;
+ 
+     /* --- Step 4: Fill in the 8-byte prefix --- */
+-    uint32_t export_vec_offset = (uint32_t)(out - 16 - code_buf);
++    uint32_t export_vec_offset = (uint32_t)(out - 4 * (WASI_SLOTS + 1) - code_buf);
+     memcpy(code_buf, &export_vec_offset, 4);
+     memcpy(code_buf + 4, &code_size, 4);
+ 
+diff --git a/tcg/wasm32/wasi-interp.c.inc b/tcg/wasm32/wasi-interp.c.inc
+index 27fdbb6..4e57af8 100644
+--- a/tcg/wasm32/wasi-interp.c.inc
++++ b/tcg/wasm32/wasi-interp.c.inc
+@@ -71,6 +71,7 @@
+  */
+ enum {
+     I_TRAP   = 0x00,    /* unreachable */
++    I_FENCE  = 0xfe,    /* atomic.fence */
+     I_IFZ    = 0x04,    /* [u32 target] pop i32, branch if zero */
+     I_JMP    = 0x0c,    /* [u32 target] */
+     I_BRNZ   = 0x0d,    /* [u32 target] pop i32, branch if non-zero */
+@@ -108,6 +109,17 @@ typedef struct InterpChunk {
+ static InterpChunk *interp_chunks;      /* current generation */
+ static InterpChunk *interp_retired;     /* waiting to be freed */
+ 
++#ifdef WASI_THREADS
++/* The vCPU threads share the arena. */
++static pthread_mutex_t interp_lock = PTHREAD_MUTEX_INITIALIZER;
++#define INTERP_LOCK()   pthread_mutex_lock(&interp_lock)
++#define INTERP_UNLOCK() pthread_mutex_unlock(&interp_lock)
++#else
++#define INTERP_LOCK()   do { } while (0)
++#define INTERP_UNLOCK() do { } while (0)
++#endif
++
++/* Called with INTERP_LOCK() held. */
+ static void *interp_alloc(size_t n)
+ {
+     InterpChunk *c = interp_chunks;
+@@ -136,6 +148,7 @@ static void *interp_alloc(size_t n)
+  */
+ static void interp_arena_retire(void)
+ {
++    INTERP_LOCK();
+     while (interp_chunks) {
+         InterpChunk *c = interp_chunks;
+ 
+@@ -143,16 +156,27 @@ static void interp_arena_retire(void)
+         c->next = interp_retired;
+         interp_retired = c;
+     }
++    INTERP_UNLOCK();
+ }
+ 
++/*
++ * With WASI_THREADS a flush runs while all other vCPUs are stopped (or
++ * there is only one vCPU), so no thread still runs a retired program by the
++ * time any thread gets here.
++ */
+ static void interp_free_retired(void)
+ {
++    if (likely(!qatomic_read(&interp_retired))) {
++        return;
++    }
++    INTERP_LOCK();
+     while (interp_retired) {
+         InterpChunk *c = interp_retired;
+ 
+         interp_retired = c->next;
+         g_free(c);
+     }
++    INTERP_UNLOCK();
+ }
+ 
+ /* ---------------------------------------------------------------------- */
+@@ -470,6 +494,10 @@ static bool skip_immediates(InterpDecoder *d, uint8_t op)
+     case 0x42:
+         rd_sleb(&d->in, 64);
+         return true;
++    case 0xfe:                                  /* atomic.fence */
++        rd_uleb32(&d->in);
++        rd_u8(&d->in);
++        return true;
+     case 0x00: case 0x01: case 0x0f: case 0x1a: case 0x1b:
+     case 0x45 ... 0x5a:
+     case 0x67 ... 0x78:
+@@ -835,6 +863,12 @@ static bool decode_body(InterpDecoder *d)
+             emit_u8(d, op);
+             break;
+         }
++        case 0xfe:                              /* threads prefix */
++            if (rd_uleb32(&d->in) != 0x03 || rd_u8(&d->in) != 0) {
++                return dec_fail(d, "unsupported atomic opcode", op);
++            }
++            emit_u8(d, I_FENCE);                /* atomic.fence */
++            break;
+         default:
+             return dec_fail(d, "unsupported opcode", op);
+         }
+@@ -897,9 +931,9 @@ static bool decode_types(InterpDecoder *d, InterpReader r)
+  */
+ static uintptr_t interp_decode(void *tb_ptr)
+ {
+-    static InterpDecoder *d;
+-    static uint8_t *body, *out;
+-    static size_t body_cap, out_cap;
++    static __thread InterpDecoder *d;
++    static __thread uint8_t *body, *out;
++    static __thread size_t body_cap, out_cap;
+     uint8_t *base = tb_ptr;
+     uint32_t code_size = *(uint32_t *)(base + 4);
+     uint8_t *code_begin = base + 8;
+@@ -995,7 +1029,9 @@ static uintptr_t interp_decode(void *tb_ptr)
+         goto fail;
+     }
+ 
++    INTERP_LOCK();
+     prog = interp_alloc(d->pos);
++    INTERP_UNLOCK();
+     memcpy(prog, out, d->pos);
+     interp_stats.decoded++;
+     interp_stats.decoded_bytes += d->pos;
+@@ -1100,6 +1136,9 @@ static uint32_t interp_exec(const uint8_t *prog, struct wasmContext *c)
+             break;
+         case I_RETURN:
+             return (uint32_t)sp[-1];
++        case I_FENCE:
++            __atomic_thread_fence(__ATOMIC_SEQ_CST);
++            break;
+         case I_CALL: {
+             uint16_t sig;
+             uint8_t np = pc[2], nr = pc[3];
+diff --git a/tcg/wasm32/wasi_platform.h b/tcg/wasm32/wasi_platform.h
+index 8c1a415..bd58db7 100644
+--- a/tcg/wasm32/wasi_platform.h
++++ b/tcg/wasm32/wasi_platform.h
+@@ -59,6 +59,7 @@ struct wasmContext {
+  */
+ #define WASI_TB_YIELD_SLICE 4000
+ 
++
+ /*
+  * Set the done flag after helper function completion.
+  * Called from ldst helpers to signal that a memory access is complete.
+diff --git a/util/async.c b/util/async.c
+index b04afcc..a9f1469 100644
+--- a/util/async.c
++++ b/util/async.c
+@@ -516,6 +516,13 @@ void aio_notify(AioContext *ctx)
+     if (qatomic_read(&ctx->notify_me)) {
+         event_notifier_set(&ctx->notifier);
+     }
++#ifdef WASI_THREADS
++    /*
++     * The main loop sleeps in the host, where the notifier does not reach
++     * it, and with glib-wasi nothing sets notify_me anyway.
++     */
++    wasi_main_wake();
++#endif
+ }
+ 
+ void aio_notify_accept(AioContext *ctx)
+diff --git a/util/event_notifier-posix.c b/util/event_notifier-posix.c
+index 478ed19..63fd742 100644
+--- a/util/event_notifier-posix.c
++++ b/util/event_notifier-posix.c
+@@ -44,7 +44,7 @@ void event_notifier_init_fd(EventNotifier *e, int fd)
+ 
+ int event_notifier_init(EventNotifier *e, int active)
+ {
+-    e->rfd = next_fake_fd++;
++    e->rfd = qatomic_fetch_inc(&next_fake_fd);
+     e->wfd = 0; /* not signaled */
+     e->initialized = true;
+     if (active) {
+@@ -78,7 +78,7 @@ int event_notifier_set(EventNotifier *e)
+     if (!e->initialized) {
+         return -1;
+     }
+-    e->wfd = 1; /* signal */
++    qatomic_set(&e->wfd, 1); /* signal */
+     return 0;
+ }
+ 
+@@ -88,8 +88,7 @@ int event_notifier_test_and_clear(EventNotifier *e)
+     if (!e->initialized) {
+         return 0;
+     }
+-    value = e->wfd;
+-    e->wfd = 0; /* clear */
++    value = qatomic_xchg(&e->wfd, 0); /* read and clear */
+     return value;
+ }
+ 
+diff --git a/util/main-loop.c b/util/main-loop.c
+index b66a950..af5eb94 100644
+--- a/util/main-loop.c
++++ b/util/main-loop.c
+@@ -140,6 +140,20 @@ static QEMUBH *qemu_notify_bh;
+ void (*wasi_idle_wait)(int64_t ns);
+ #endif
+ 
++#ifdef WASI_THREADS
++/* Host import: end the main thread's current or next host_net_wait(). */
++extern void host_main_wake(void);
++
++static __thread bool wasi_main_thread;
++
++void wasi_main_wake(void)
++{
++    if (!wasi_main_thread) {
++        host_main_wake();
++    }
++}
++#endif
++
+ static void notify_event_cb(void *opaque)
+ {
+     /* No need to do anything; this bottom half is only used to
+@@ -168,6 +182,9 @@ int qemu_init_main_loop(Error **errp)
+     GSource *src;
+ 
+     WASI_LOG_V("WASI_DBG: main_loop: before init_clocks\n");
++#ifdef WASI_THREADS
++    wasi_main_thread = true;
++#endif
+     init_clocks(qemu_timer_notify_cb);
+     WASI_LOG_V("WASI_DBG: main_loop: after init_clocks\n");
+ 
+@@ -601,7 +618,30 @@ void main_loop_wait(int nonblocking)
+                                       timerlistgroup_deadline_ns(
+                                           &main_loop_tlg));
+ 
+-#ifdef WASI_PLATFORM
++#ifdef WASI_THREADS
++    /*
++     * The vCPUs run on threads of their own: sleep until the next timer
++     * deadline, with the BQL released for them.  Other threads end the
++     * sleep early through wasi_main_wake() (see aio_notify()); the cap is
++     * for host input, which the display refresh polls.
++     */
++    if (!nonblocking) {
++        const int64_t max_idle_ns = 30 * SCALE_MS;
++        int64_t ns = timeout_ns < 0 ? max_idle_ns : MIN(timeout_ns, max_idle_ns);
++
++        if (ns > 0) {
++            bql_unlock();
++            if (wasi_idle_wait) {
++                wasi_idle_wait(ns);
++            } else {
++                struct timespec ts = { .tv_sec = 0, .tv_nsec = ns };
++
++                nanosleep(&ts, NULL);
++            }
++            bql_lock();
++        }
++    }
++#elif defined(WASI_PLATFORM)
+     /*
+      * g_poll() is a stub on WASI (glib-wasi) and never waits.  When the
+      * caller is willing to block -- the WASI main loop only asks when every
+diff --git a/util/qemu-thread-posix.c b/util/qemu-thread-posix.c
+index b2e26e2..05c174c 100644
+--- a/util/qemu-thread-posix.c
++++ b/util/qemu-thread-posix.c
+@@ -563,6 +563,14 @@ void qemu_thread_create(QemuThread *thread, const char *name,
+     if (mode == QEMU_THREAD_DETACHED) {
+         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+     }
++#ifdef WASI_THREADS
++    /*
++     * wasi-libc's default stack is small, and a vCPU thread's stack also
++     * holds the frames of its vCPU's own wasm instance (see
++     * wasi_vcpu_thread_run()).
++     */
++    pthread_attr_setstacksize(&attr, 16 * 1024 * 1024);
++#endif
+ 
+     /* Leave signal handling to the iothread.  */
+     sigfillset(&set);

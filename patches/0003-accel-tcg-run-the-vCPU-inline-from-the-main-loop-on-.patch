@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Abe Massry <amassry@linode.com>
 Date: Wed, 14 Oct 2026 17:34:27 -0400
-Subject: [PATCH 3/7] accel/tcg: run the vCPU inline from the main loop on WASI
+Subject: [PATCH 3/8] accel/tcg: run the vCPU inline from the main loop on WASI
 
 WASI has no threads (pthread_create() is a stub that never runs the
 thread), so the round-robin vCPU cannot have a thread of its own.

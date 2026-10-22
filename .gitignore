@@ -1,11 +1,15 @@
 # Build outputs (see Makefile)
 /qemu-src/
 /qemu-build/
+/qemu-build-threads/
 /qemu-native/
 /zlib-src/
 /zlib-wasi/
+/zlib-wasi-threads/
 /glib-wasi/build/
+/glib-wasi/build-threads/
 /wasi-stubs/build/
+/wasi-stubs/build-threads/
 *.a
 *.o
 *.d

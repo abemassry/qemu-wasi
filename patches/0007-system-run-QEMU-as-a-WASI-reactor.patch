@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Abe Massry <amassry@linode.com>
 Date: Wed, 14 Oct 2026 17:34:27 -0400
-Subject: [PATCH 7/7] system: run QEMU as a WASI reactor
+Subject: [PATCH 7/8] system: run QEMU as a WASI reactor
 
 Link QEMU as a WASI reactor that the host drives one main loop
 iteration at a time, rather than as a command whose main() never

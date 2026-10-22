@@ -11,16 +11,29 @@
 # sysroot's, to fill in missing declarations (see QEMU's osdep.h).
 
 WASI_SDK ?= /opt/wasi-sdk
-CC       := $(WASI_SDK)/bin/wasm32-wasip1-clang
 AR       := $(WASI_SDK)/bin/llvm-ar
 
 CFLAGS   := -O2 -g -Wall -I$(CURDIR) \
             -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS \
             -D_WASI_EMULATED_MMAN
 
+# THREADS=1: for QEMU's multi-threaded build (wasm32-wasip1-threads), whose
+# libc has real pthreads: only the few functions it lacks are stubbed
+# (pthread_threads_stubs.c).  Built separately, as libwasi-stubs-threads.a.
+THREADS  ?= 0
+ifeq ($(THREADS),1)
+CC       := $(WASI_SDK)/bin/wasm32-wasip1-threads-clang
+CFLAGS   += -pthread -DWASI_THREADS
+SRCS     := posix_stubs.c pthread_threads_stubs.c socket_stubs.c syslog_stub.c
+BUILD    := build-threads
+LIB      := libwasi-stubs-threads.a
+else
+CC       := $(WASI_SDK)/bin/wasm32-wasip1-clang
 SRCS     := posix_stubs.c pthread_stubs.c socket_stubs.c syslog_stub.c
-OBJS     := $(SRCS:%.c=build/%.o)
+BUILD    := build
 LIB      := libwasi-stubs.a
+endif
+OBJS     := $(SRCS:%.c=$(BUILD)/%.o)
 
 .PHONY: all clean
 
@@ -30,13 +43,13 @@ $(LIB): $(OBJS)
 	rm -f $@
 	$(AR) rcs $@ $^
 
-build/%.o: %.c | build
+$(BUILD)/%.o: %.c | $(BUILD)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
-build:
+$(BUILD):
 	mkdir -p $@
 
 clean:
-	rm -rf build $(LIB)
+	rm -rf $(BUILD) $(LIB)
 
 -include $(OBJS:.o=.d)
