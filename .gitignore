@@ -10,6 +10,7 @@
 /glib-wasi/build-threads/
 /wasi-stubs/build/
 /wasi-stubs/build-threads/
+/tools/perf/work/
 *.a
 *.o
 *.d

@@ -10,7 +10,7 @@
  * start routines are not called. This is acceptable for a single-threaded
  * WASI environment because:
  *
- *   - RCU thread: deferred frees never happen (small memory leak, OK)
+ *   - RCU thread: the main loop runs the deferred frees (QEMU patch 0004)
  *   - Worker threads: work items run inline when waited on
  *   - The main execution (CPU loop) is single-threaded anyway
  *

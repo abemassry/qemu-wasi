@@ -1,0 +1,29 @@
+#!/bin/sh
+# qemu-profile.start: log what the guest is doing to its serial port, for
+# tools/perf (analyze-serial.py).  Installed as /etc/local.d/qemu-profile.start
+# by prepare-base.sh; OpenRC's "local" service runs it at the end of boot.
+# Every 10 seconds it writes:
+#   === UPTIME intr N ctxt N processes N pswpin N pswpout N pgfault N pgmajfault N
+#   (the kernel's counters: interrupts, context switches, processes
+#   started, pages swapped in and out, page faults)
+#   top's summary and the busiest processes (18 lines)
+# and every 40 seconds the interrupt counters per CPU:
+#   === interrupts at UPTIME
+#   =I= ...each line of /proc/interrupts...
+out=/dev/ttyS0
+top -b -d 10 | awk '/^Mem:/ { n = 0 } { if (++n <= 18) print; fflush() }' > $out &
+(
+    i=0
+    while :; do
+        up=$(cut -d' ' -f1 /proc/uptime)
+        s=$(awk '$1 == "intr" || $1 == "ctxt" || $1 == "processes" { printf "%s %s ", $1, $2 }' /proc/stat)
+        v=$(awk '$1 == "pswpin" || $1 == "pswpout" || $1 == "pgfault" || $1 == "pgmajfault" { printf "%s %s ", $1, $2 }' /proc/vmstat)
+        echo "=== $up $s$v" > $out
+        if [ $((i % 4)) = 0 ]; then
+            echo "=== interrupts at $up" > $out
+            sed 's/^/=I= /' /proc/interrupts > $out
+        fi
+        i=$((i + 1))
+        sleep 10
+    done
+) > /dev/null 2>&1 &

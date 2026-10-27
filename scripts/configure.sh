@@ -30,10 +30,14 @@ for lib in "$top/glib-wasi/libglib-wasi$variant.a" \
 done
 
 # pkg-config files for QEMU's two required libraries: glib-wasi/, a
-# minimal GLib for WASI, and zlib (built by scripts/build-zlib.sh).
+# minimal GLib for WASI, and zlib (built by scripts/build-zlib.sh).  The
+# library is the variant being built (libglib-wasi-threads.a for
+# THREADS=1): naming the single-threaded one too would make the threads
+# build need it, and could link its no-op locks.
 mkdir -p "$build/pkgconfig"
 for pc in glib-2.0 gmodule-2.0 gthread-2.0; do
-    sed "s|@GLIB_WASI_PREFIX@|$top/glib-wasi|g" \
+    sed -e "s|@GLIB_WASI_PREFIX@|$top/glib-wasi|g" \
+        -e "s|-lglib-wasi\$|-lglib-wasi$variant|" \
         "$top/glib-wasi/pkgconfig/$pc.pc" > "$build/pkgconfig/$pc.pc"
 done
 export PKG_CONFIG_LIBDIR=$build/pkgconfig:$zlib/lib/pkgconfig

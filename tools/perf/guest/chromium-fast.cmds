@@ -1,0 +1,10 @@
+mkdir -p /etc/chromium
+cat > /etc/chromium/zz-fast.conf << 'EOF'
+# Lighter Chromium for a slow (emulated) machine: no GPU process, no
+# background services, one renderer process, no crash-restore bubble (closing
+# m-browser cuts the guest's power, so Chromium always thinks it crashed).
+CHROMIUM_FLAGS="$CHROMIUM_FLAGS --disable-gpu --disable-gpu-compositing --disable-background-networking --disable-component-update --disable-sync --no-first-run --no-default-browser-check --disable-default-apps --hide-crash-restore-bubble --renderer-process-limit=1"
+CHROMIUM_FLAGS="$CHROMIUM_FLAGS --disable-features=Translate,MediaRouter,OptimizationHints,OptimizationGuideModelDownloading,AutofillServerCommunication,InterestFeedContentSuggestions,CertificateTransparencyComponentUpdater"
+EOF
+sed -i 's/^chromium &$/chromium about:blank \&/' /home/m/.fluxbox/startup
+cat /etc/chromium/zz-fast.conf /home/m/.fluxbox/startup > /dev/ttyS0
