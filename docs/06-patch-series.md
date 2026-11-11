@@ -156,7 +156,8 @@ stack switching. 14 files, +697 -58.
 | `util/memalign.c`, `util/mmap-alloc.c` | Aligned buffers and guest RAM from `aligned_alloc()` |
 | `util/event_notifier-posix.c` | An event notifier is a flag with a fake fd number (1000 up) |
 | `crypto/random-platform.c` | `getentropy()` |
-| `util/coroutine-wasi.c` (new) | Coroutine backend without stack switching |
+| `util/coroutine-wasi.c` (new) | Coroutine backend without stack switching; `qemu_coroutine_wasi_run_outside()`, declared in `include/qemu/coroutine_int.h`, calls a function outside any coroutine |
+| `block/file-posix.c` | New image files are created without lock bytes (WASI has no file locks; opened images already skip them, as `locking=auto` finds no OFD locks) |
 
 **Design decisions.** *Macros, not functions, for `sigsetjmp()`:* with
 `-mllvm -wasm-enable-sjlj` each `setjmp()` call becomes wasm exception
@@ -240,7 +241,7 @@ main loop runs the vCPU itself, one time slice per iteration, with
 
 | File | What changes |
 |---|---|
-| `accel/tcg/tcg-accel-ops-rr.c` | `rr_start_vcpu_thread()` sets up inline and records the one thread as the vCPU thread; `wasi_rr_cpu_step()`, a copy of `rr_cpu_thread_fn()`'s loop body |
+| `accel/tcg/tcg-accel-ops-rr.c` | `rr_start_vcpu_thread()` sets up inline and records the one thread as the vCPU thread; `wasi_rr_cpu_step()`, a copy of `rr_cpu_thread_fn()`'s loop body, which leaves `current_cpu` NULL for the main loop (else `vm_stop()` took the main loop for the vCPU and `stop` never stopped) |
 | `accel/tcg/tcg-all.c` | Multi-threaded TCG (MTTCG) off, `thread=multi` refused |
 | `accel/tcg/cpu-exec.c` | Time-slice exit in `cpu_handle_interrupt()`; translation time for the profile; `QEMU_DUMP_AT`, `QEMU_LOOP_DIAG`, TB history (all hosts) |
 | `accel/tcg/cputlb.c` | `io_prepare()` lets I/O proceed instead of `cpu_io_recompile()`; unaligned accesses logged |
@@ -285,10 +286,12 @@ scheduled from coroutines; the block layer's graph lock; RCU callbacks
 |---|---|
 | `util/main-loop.c` | `main_loop_wait()` sleeps until the next timer (at most 10 ms, through `wasi_idle_wait` if set) when every vCPU is idle, then polls the main and iohandler AioContexts; no signal setup |
 | `include/qemu/main-loop.h` | Declares `wasi_idle_wait` |
-| `util/async.c` | A one-shot BH scheduled from a coroutine runs at once; waking the running coroutine does nothing |
+| `util/async.c` | A one-shot BH scheduled from a coroutine runs at once, outside the coroutine (as BHs run elsewhere; `bdrv_open()` asserts it); waking the running coroutine, or the one whose BH runs, does nothing |
 | `block/graph-lock.c` | `bdrv_graph_wrlock()` in a coroutine takes the lock without draining |
 | `util/rcu.c`, `include/qemu/rcu.h` | `rcu_run_callbacks_inline()` |
 | `util/thread-pool.c` | `thread_pool_submit_co()` runs the work synchronously |
+| `migration/file.c` | An incoming `file:` migration starts from a BH, not from a watch for "readable" that `g_poll()` never reports |
+| `migration/ram.c` | No periodic schedule-and-yield while loading RAM: the yield returns at once, and the next schedule aborted (`Co-routine was already scheduled`) |
 
 **Design decisions.** AioContexts (QEMU's event loops) normally run as
 GLib sources; without the direct `aio_poll()` no main-context BH, timer or
@@ -373,11 +376,13 @@ not compiled into this binary".
 makes QEMU a WASI *reactor*, a module whose functions the host calls again
 and again: `wasi_qemu_init()`, `wasi_qemu_step()` (one main loop
 iteration; -1 to go on, else the exit status), `wasi_qemu_jit_reset()`,
-`wasi_qemu_quit()`. 5 files, +344 -3.
+`wasi_qemu_quit()`; and `wasi_qemu_monitor()` with its buffer
+(`wasi_qemu_buffer()`, `wasi_qemu_buffer_size()`), which runs a human
+monitor command for the host. 5 files, +344 -3.
 
 | File | What changes |
 |---|---|
-| `system/main.c` | The four exports; `WASI_LOG()` in `main()` |
+| `system/main.c` | The seven exports; `WASI_LOG()` in `main()` |
 | `system/runstate.c` | `qemu_main_loop_step()`: main loop, network frames, vCPU slice, RCU callbacks, profile; `qemu_main_loop()` repeats it; `QEMU_STATUS_EVERY`; `WASI_LOG()` |
 | `include/sysemu/sysemu.h` | Declares `qemu_main_loop_step()` |
 | `system/vl.c` | Unreadable default config ignored; wasi-gfx display registered (`wasi_gfx_display_register_dcl()`, qemu-wasi's `display/`); `user` default network; 77 `WASI_LOG()` calls |
@@ -399,7 +404,7 @@ tracing, so drop them on conflict. `qemu_main_loop_step()` repeats
 `qemu_main_loop()`'s body: compare by hand. `include/sysemu/` has moved
 upstream (see 0001).
 
-**How to tell it works.** The module exports the four functions
+**How to tell it works.** The module exports the seven functions
 ([reference/host-interface.md](reference/host-interface.md) shows how to
 list them), m-browser starts it, and closing its window ends QEMU with
 exit status 0. Without the patch QEMU could only run as a command
@@ -468,6 +473,7 @@ marks a file the series creates (in the first patch listed).
 | `accel/tcg/ldst_common.c.inc` | 0002 |
 | `accel/tcg/tcg-accel-ops-mttcg.c` | 0008 |
 | `block/graph-lock.c` | 0004 |
+| `block/file-posix.c` | 0001 |
 | `configure`, `meson_options.txt`, `os-posix.c` | 0001 |
 | `cpu-common.c` | 0003, 0008 |
 | `crypto/random-platform.c` | 0001 |
@@ -477,12 +483,14 @@ marks a file the series creates (in the first patch listed).
 | `include/hw/core/tcg-cpu-ops.h` | 0003 |
 | `include/net/net.h`, `net/net.c`, `net/wasi-user.c.inc` (new) | 0006 |
 | `include/qemu/atomic.h`, `include/qemu/osdep.h`, `include/qemu/wasi-debug.h` (new) | 0001 |
+| `include/qemu/coroutine_int.h` | 0001 |
 | `include/qemu/main-loop.h` | 0004, 0008 |
 | `include/qemu/rcu.h` | 0004 |
 | `include/sysemu/os-posix.h` | 0001 |
 | `include/sysemu/sysemu.h` | 0007 |
 | `include/ui/pixman-minimal.h`, `include/ui/qemu-pixman.h` | 0005 |
 | `meson.build` | 0001, 0008 |
+| `migration/file.c`, `migration/ram.c` | 0004 |
 | `monitor/monitor.c` | 0007 |
 | `system/cpus.c` | 0003, 0008 |
 | `system/main.c`, `system/runstate.c` | 0007, 0008 |
